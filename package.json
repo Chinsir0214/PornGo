@@ -1,0 +1,68 @@
+{
+  "name": "porn-go",
+  "version": "0.9.4",
+  "private": true,
+  "description": "Desktop video downloader with an embedded website sign-in window.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/pornhub.js && node --check src/auth-status.js && node --check src/credential-store.js && node --check src/login-credentials.js && node --check src/download-queue.js && node --check src/download-process.js && node --check src/download-artifact.js && node --check src/download-directory.js && node --check src/download-tasks.js && node --check src/resource-parser.js && node --check src/playlist.js && node --check src/renderer.js",
+    "test": "node --test test/*.test.js",
+    "verify:tools": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1 -VerifyOnly",
+    "dist": "npm run verify:tools && electron-builder --win",
+    "dist:portable": "npm run verify:tools && electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "45.1.0",
+    "electron-builder": "^26.18.1",
+    "typescript": "^6.0.3",
+    "typescript-language-server": "^6.0.2"
+  },
+  "build": {
+    "appId": "com.porngo.app",
+    "productName": "PornGo",
+    "icon": "assets/icon-0.9.2.ico",
+    "asar": true,
+    "npmRebuild": false,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "assets/icon-0.9.2.ico",
+        "to": "assets/icon-0.9.2.ico"
+      },
+      {
+        "from": "tools",
+        "to": "tools",
+        "filter": [
+          "yt-dlp.exe",
+          "ffmpeg.exe",
+          "README.md",
+          "tool-versions.json",
+          "licenses/**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "executableName": "PornGo"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "createDesktopShortcut": true
+    },
+    "portable": {
+      "artifactName": "PornGo-${version}-portable.exe"
+    },
+    "directories": {
+      "output": "release"
+    }
+  }
+}

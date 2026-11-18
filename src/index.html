@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+    <title>PornGo · 开始下载</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./renderer.js" defer></script>
+  </head>
+  <body>
+    <div class="launch-screen" aria-hidden="true">
+      <span class="launch-wordmark">PornGo</span>
+      <span class="launch-dots"><i></i><i></i><i></i><i></i><i></i></span>
+    </div>
+    <div class="app-shell">
+      <header class="app-header" aria-label="窗口标题栏">
+        <div class="brand" aria-label="PornGo">
+          <span class="brand-mark" aria-hidden="true"><span></span></span>
+          <span class="brand-name">Porn<span>Go</span></span>
+          <span class="brand-caption">视频下载器</span>
+        </div>
+        <div class="header-actions">
+          <span id="session-pill" class="session-pill" data-state="empty">
+            <span class="session-dot" aria-hidden="true"></span>
+            <span id="session-label">正在检查会话</span>
+          </span>
+          <button id="login-button" class="button button-header" type="button" disabled>内嵌网页登录</button>
+        </div>
+        <div class="window-controls" role="group" aria-label="窗口控制">
+          <button id="window-minimize" class="window-control window-minimize" type="button" aria-label="最小化窗口" title="最小化"><span aria-hidden="true"></span></button>
+          <button id="window-maximize" class="window-control window-maximize" type="button" aria-label="最大化窗口" title="最大化"><span aria-hidden="true"></span></button>
+          <button id="window-close" class="window-control window-close" type="button" aria-label="关闭窗口" title="关闭"><span aria-hidden="true"></span></button>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="main-column" aria-label="视频下载">
+          <div class="intro">
+            <div class="intro-copy">
+              <p class="eyebrow">PORN GO / START</p>
+              <h1>开始下载<span class="heading-spark" aria-hidden="true">.</span></h1>
+              <p>粘贴视频、片单或色情明星主页地址，选择画质与保存位置。</p>
+            </div>
+            <div class="live-tile" aria-hidden="true">
+              <span class="live-tile-mark">PG</span>
+              <div class="live-tile-scenes">
+                <span>单个视频<small>贴上地址，马上解析</small></span>
+                <span>完整片单<small>多条内容，并行下载</small></span>
+                <span>明星主页<small>视频列表，一次获取</small></span>
+              </div>
+              <span class="live-tile-label">支持的内容 / LIVE</span>
+            </div>
+          </div>
+
+          <div id="notice" class="notice" role="status" aria-live="polite" hidden>
+            <span id="notice-message"></span>
+            <button id="notice-close" class="icon-button" type="button" aria-label="关闭提示" disabled>×</button>
+          </div>
+
+          <section class="card url-card" aria-labelledby="url-title">
+            <div class="section-heading">
+              <span class="section-icon">01</span>
+              <div>
+                <h2 id="url-title" class="section-title">添加链接</h2>
+                <p>支持 Pornhub 单视频、片单和色情明星主页</p>
+              </div>
+            </div>
+            <form id="parse-form" class="url-form" novalidate>
+              <label class="sr-only" for="video-url">Pornhub 页面网址</label>
+              <div class="url-input-wrap">
+                <input id="video-url" class="field-control url-input" name="video-url" type="url" placeholder="粘贴页面网址" spellcheck="false" autocomplete="off" inputmode="url" aria-describedby="url-help" required />
+                <button id="url-clear" class="icon-button input-clear" type="button" aria-label="清除网址" hidden disabled>×</button>
+              </div>
+              <button id="parse-button" class="button button-light" type="submit" disabled>解析链接</button>
+            </form>
+            <p id="url-help" class="field-help">支持 Pornhub 视频、片单和明星视频页（HTTP/HTTPS）</p>
+          </section>
+
+          <section class="card video-card" aria-labelledby="video-title">
+            <div class="section-heading">
+              <span class="section-icon">02</span>
+              <div>
+                <h2 id="video-title" class="section-title">内容信息</h2>
+                <p>确认内容并选择下载画质</p>
+              </div>
+            </div>
+            <p id="video-empty" class="empty-state">
+              <span class="empty-video-icon" aria-hidden="true">▶</span>
+              <span>解析后，内容信息会显示在这里</span>
+            </p>
+            <div id="video-details" class="video-details" hidden>
+              <div id="thumbnail-frame" class="thumbnail-frame">
+                <img id="video-thumbnail" alt="视频封面" hidden />
+                <span id="thumbnail-placeholder" class="thumbnail-placeholder" aria-hidden="true">▶</span>
+              </div>
+              <div class="video-copy">
+                <p id="resource-kind" class="video-kicker">已解析的视频</p>
+                <h3 id="parsed-title" class="text-ellipsis"></h3>
+                <p id="video-meta" class="video-meta"></p>
+              </div>
+            </div>
+            <div id="format-row" class="field-row" hidden>
+              <label for="format-select">下载画质</label>
+              <div class="select-wrap"><select id="format-select" class="field-control"></select></div>
+            </div>
+          </section>
+
+          <section class="card destination-card" aria-labelledby="destination-title">
+            <div class="section-heading">
+              <span class="section-icon">03</span>
+              <div>
+                <h2 id="destination-title" class="section-title">保存位置</h2>
+                <p>默认保存到系统下载文件夹，也可选择其他位置</p>
+              </div>
+            </div>
+            <div class="directory-row">
+              <div class="directory-path" aria-live="polite"><span class="folder-icon" aria-hidden="true">▱</span><span id="directory-label" class="text-ellipsis">正在读取保存目录…</span></div>
+              <button id="directory-button" class="button button-light" type="button" disabled>选择文件夹</button>
+            </div>
+          </section>
+
+          <section id="concurrency-card" class="card concurrency-card" aria-labelledby="concurrency-title" hidden>
+            <div class="concurrency-heading">
+              <h2 id="concurrency-title">下载并发</h2>
+              <p>分别控制单条视频的分片与片单中的视频数量</p>
+            </div>
+            <div class="concurrency-fields">
+              <div class="concurrency-field">
+                <label for="fragment-concurrency">单视频分片</label>
+                <div class="select-wrap"><select id="fragment-concurrency" class="field-control" disabled></select></div>
+              </div>
+              <div class="concurrency-field">
+                <label for="video-concurrency">同时下载视频</label>
+                <div class="select-wrap"><select id="video-concurrency" class="field-control" aria-describedby="video-concurrency-help" disabled></select></div>
+              </div>
+            </div>
+            <p id="video-concurrency-help" class="concurrency-help">分片并发仅对分片格式生效；同时下载视频仅对片单和主页生效。</p>
+          </section>
+
+          <button id="download-button" class="button button-block button-download" type="button" disabled><span class="download-icon" aria-hidden="true">↓</span><span id="download-label">开始下载</span></button>
+        </section>
+
+        <aside class="side-column" aria-label="账户与下载状态">
+          <section class="card login-card" aria-labelledby="login-title">
+            <div class="section-heading">
+              <span class="section-icon" aria-hidden="true">◉</span>
+              <div><span class="eyebrow">ACCOUNT</span><h2 id="login-title" class="section-title">网页登录</h2></div>
+            </div>
+            <p id="login-help">在内嵌窗口登录 Pornhub。解析和下载会自动使用该窗口保存的网站会话。</p>
+            <div class="session-summary"><span>内嵌会话</span><strong id="session-summary">正在检查</strong></div>
+            <button id="logout-button" class="text-button" type="button" hidden disabled>清除内嵌会话</button>
+            <div class="credentials-section" aria-label="记住账号密码">
+              <button id="credentials-save" class="button button-light button-block credentials-button" type="button" disabled>保存网页登录账号密码</button>
+              <button id="credentials-fill" class="text-button" type="button" hidden disabled>填入已保存账号密码</button>
+              <button id="credentials-delete" class="text-button" type="button" hidden disabled>删除保存的账号密码</button>
+            </div>
+          </section>
+
+          <section class="card progress-card" aria-labelledby="progress-title">
+            <div class="section-heading">
+              <span class="section-icon" aria-hidden="true">↓</span>
+              <div><span class="eyebrow">DOWNLOAD</span><h2 id="progress-title" class="section-title">下载进度</h2></div>
+            </div>
+            <p id="progress-empty" class="empty-state progress-empty">等待开始下载</p>
+            <div id="progress-content" hidden>
+              <div class="progress-heading"><strong id="progress-status" class="text-ellipsis" tabindex="-1">准备中</strong><span id="progress-percent">0%</span></div>
+              <div id="progress-track" class="progress-track" role="progressbar" aria-label="下载进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div>
+              <p id="progress-item" class="progress-item" aria-live="polite" hidden></p>
+              <div id="progress-videos" class="download-list progress-videos" role="list" aria-label="正在下载的视频" hidden></div>
+              <p id="progress-detail" class="progress-detail">正在准备下载…</p>
+              <button id="queue-toggle" class="queue-toggle" type="button" aria-expanded="false" aria-controls="queue-list" hidden>
+                <span id="queue-status" class="queue-status" role="status" aria-live="polite"></span>
+                <span class="queue-toggle-icon" aria-hidden="true">⌄</span>
+              </button>
+              <div id="queue-list" class="download-list queue-list" aria-label="等待中的下载任务" hidden></div>
+              <button id="cancel-button" class="button button-outline button-block" type="button" disabled>取消下载</button>
+            </div>
+          </section>
+          <section id="failed-downloads" class="card failed-downloads" aria-labelledby="failed-downloads-title" hidden>
+            <h2 id="failed-downloads-title" class="section-title">未成功的项目</h2>
+            <p class="failed-help">任务结束后列出最终失败项。勾选后按原画质、目录和并发设置重新下载。</p>
+            <div id="failed-batches"></div>
+          </section>
+          <p class="sidebar-footnote">请仅下载你有权保存的内容。</p>
+        </aside>
+      </main>
+    </div>
+    <dialog id="clear-session-dialog" class="confirm-dialog" aria-labelledby="clear-session-title" aria-describedby="clear-session-description">
+      <form method="dialog" novalidate>
+        <span class="dialog-kicker">ACCOUNT / CLEAR</span>
+        <h2 id="clear-session-title">清除内嵌会话？</h2>
+        <p id="clear-session-description">这会删除本应用保存的网站数据。下次解析或下载若需要登录，请重新打开网页登录。保存的账号密码会保留，可另行点击“删除保存的账号密码”。</p>
+        <div class="dialog-actions">
+          <button id="clear-session-cancel" class="button button-light" value="cancel">保留会话</button>
+          <button id="clear-session-confirm" class="button button-danger" value="confirm">清除会话</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="delete-credentials-dialog" class="confirm-dialog" aria-labelledby="delete-credentials-title" aria-describedby="delete-credentials-description">
+      <form method="dialog" novalidate>
+        <span class="dialog-kicker">ACCOUNT / PASSWORD</span>
+        <h2 id="delete-credentials-title">删除保存的账号密码？</h2>
+        <p id="delete-credentials-description">删除后不会再自动填充。当前网站登录会话仍会保留。</p>
+        <div class="dialog-actions">
+          <button id="delete-credentials-cancel" class="button button-light" value="cancel">保留账号密码</button>
+          <button class="button button-danger" value="confirm">删除账号密码</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>
