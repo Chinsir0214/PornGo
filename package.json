@@ -1,6 +1,6 @@
 {
   "name": "porn-go",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "private": true,
   "description": "Desktop video downloader with an embedded website sign-in window.",
   "main": "src/main.js",

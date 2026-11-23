@@ -19,13 +19,14 @@
   --tile-gap: 12px;
   --page-gutter: clamp(22px, 3vw, 38px);
   --titlebar-height: 54px;
+  --header-height: var(--titlebar-height);
   font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   background: var(--canvas);
   color: var(--white);
-  scroll-padding-top: var(--titlebar-height);
+  scroll-padding-top: var(--header-height);
 }
 
 * { box-sizing: border-box; scrollbar-color: #8b7bc5 var(--canvas-deep); scrollbar-width: thin; }
@@ -79,7 +80,7 @@ button:disabled { cursor: not-allowed; opacity: .56; }
 .app-shell { min-height: 100vh; background: var(--canvas); }
 .app-header {
   position: sticky; top: 0; z-index: 30;
-  height: var(--titlebar-height); padding-inline-start: var(--page-gutter);
+  height: var(--header-height); padding-inline-start: var(--page-gutter);
   display: flex; align-items: center; gap: 22px;
   background: var(--canvas-deep);
   -webkit-app-region: drag;
@@ -97,8 +98,11 @@ button:disabled { cursor: not-allowed; opacity: .56; }
 .session-dot { width: 8px; height: 8px; background: #938aaf; }
 .session-pill[data-state="verified"] .session-dot,
 .session-pill[data-state="recently-verified"] .session-dot { background: var(--amber); }
-.window-controls { display: flex; height: 100%; margin-left: 5px; }
-.window-control { --control-focus-offset: -5px; position: relative; width: 46px; height: 100%; }
+.window-controls { flex: none; display: flex; height: var(--titlebar-height); margin-left: 5px; }
+.window-control {
+  --control-focus-offset: -5px;
+  position: relative; display: grid; place-items: center; width: 46px;
+}
 .window-control:hover { background: var(--subtle-action-fill); }
 .window-control:active { background: #ffffff38; }
 .window-control:focus-visible { z-index: 1; }
@@ -107,7 +111,6 @@ button:disabled { cursor: not-allowed; opacity: .56; }
 .window-control .ui-icon--window-restore { display: none; }
 .window-maximize.is-maximized .ui-icon--window-maximize { display: none; }
 .window-maximize.is-maximized .ui-icon--window-restore { display: block; }
-.window-close:hover .ui-icon, .window-close:active .ui-icon { width: 16px; height: 16px; }
 
 .workspace {
   width: min(1380px, 100%); display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
@@ -378,11 +381,21 @@ button:disabled { cursor: not-allowed; opacity: .56; }
 @media (max-width: 760px) {
   :root { --page-gutter: 20px; }
   .workspace { padding-block: 26px 40px; }
-  .app-header { padding: 17px var(--page-gutter); }
 }
 @media (max-width: 560px) {
-  .app-header { flex-wrap: wrap; }
-  .header-actions { width: 100%; justify-content: space-between; gap: 10px; }
+  :root { --header-height: calc(var(--titlebar-height) + 44px); }
+  .app-header {
+    display: grid; grid-template: var(--titlebar-height) 1fr / minmax(0, 1fr) auto;
+    gap: 0;
+  }
+  .brand { overflow: hidden; }
+  .brand-mark { flex: none; }
+  .brand-caption { overflow: hidden; text-overflow: ellipsis; }
+  .header-actions {
+    grid-row: 2; grid-column: 1 / -1;
+    margin-left: 0; padding-inline-end: var(--page-gutter); justify-content: space-between; gap: 10px;
+  }
+  .window-controls { grid-area: 1 / 2; }
   .session-pill { white-space: normal; }
   .intro { min-height: 0; }
   .intro h1 { font-size: 46px; }

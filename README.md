@@ -1,6 +1,6 @@
 # PornGo
 
-当前版本：**0.9.5**。版本变更见 [更新日志](CHANGELOG.md)。
+当前版本：**0.9.6**。版本变更见 [更新日志](CHANGELOG.md)。
 
 Windows x64 用户可以从 [GitHub Releases](https://github.com/Chinsir0214/PornGo/releases/latest) 下载安装版或单文件便携版。两者都内置 yt-dlp 和 FFmpeg。
 
@@ -21,7 +21,7 @@ npm start
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1
 ```
 
-如果新检出仓库时下载脚本遇到上游 404，请下载并运行 `PornGo-0.9.5-setup.exe`。将安装目录 `resources\tools` 中的 `yt-dlp.exe` 和 `ffmpeg.exe` 复制到仓库的 `tools` 目录，然后在仓库根目录运行 `npm run verify:tools`。[PornGo v0.9.5](https://github.com/Chinsir0214/PornGo/releases/tag/v0.9.5)
+如果新检出仓库时下载脚本遇到上游 404，请下载并运行 `PornGo-0.9.6-setup.exe`。将安装目录 `resources\tools` 中的 `yt-dlp.exe` 和 `ffmpeg.exe` 复制到仓库的 `tools` 目录，然后在仓库根目录运行 `npm run verify:tools`。[PornGo v0.9.6](https://github.com/Chinsir0214/PornGo/releases/tag/v0.9.6)
 
 应用优先使用本仓库 `tools` 中的 `yt-dlp.exe`、`ffmpeg.exe`，也可使用系统 `PATH` 中的工具。固定版本、来源和 SHA-256 见 [tools/README.md](tools/README.md)。源码运行和打包都使用本仓库的工具，不依赖相邻项目。
 
