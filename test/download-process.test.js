@@ -6,9 +6,8 @@ const { spawn } = require('node:child_process');
 const { EventEmitter, once } = require('node:events');
 const { downloadSpawnOptions, terminateProcessTree } = require('../src/download-process');
 
-test('downloaders use separate process groups outside Windows', () => {
-  assert.equal(downloadSpawnOptions('win32').detached, false);
-  assert.equal(downloadSpawnOptions('linux').detached, true);
+test('download roots are detached from the utility and never open a console', () => {
+  assert.deepEqual(downloadSpawnOptions(), { windowsHide: true, shell: false, detached: true });
 });
 
 test('Windows termination targets the created PID and waits for tree killer', async () => {

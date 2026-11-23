@@ -1,12 +1,15 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
+const path = require('node:path');
 const { StringDecoder } = require('node:string_decoder');
 const { artifactYtdlpArgs, parseFileMetadata, applyPublicationTime } = require('./download-artifact');
 const { parseProgressLine, explainYtdlpError } = require('./pornhub');
 
-function downloadSpawnOptions(platform = process.platform) {
-  return { windowsHide: true, shell: false, detached: platform !== 'win32' };
+function downloadSpawnOptions() {
+  // Keep the tree root alive if the utility dies. On Windows libuv's default
+  // job kills only direct children, leaving FFmpeg without a root for taskkill.
+  return { windowsHide: true, shell: false, detached: true };
 }
 
 function stopDirectChild(child) {
@@ -125,6 +128,7 @@ function runDownloadProcess(task, { video }, reportProgress, {
           complete(`视频已下载，但设置发布时间失败：${error.message}`);
           return;
         }
+        video.downloadFileName = path.basename(fileMetadata.filepath);
       }
       complete(code === 0 ? null : explainYtdlpError(stderr, `下载失败（退出码 ${code}）。`));
     });

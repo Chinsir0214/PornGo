@@ -28,7 +28,13 @@
     urlClear: document.getElementById('url-clear'),
     parseButton: document.getElementById('parse-button'),
     videoEmpty: document.getElementById('video-empty'),
+    videoPreview: document.getElementById('video-preview'),
     videoDetails: document.getElementById('video-details'),
+    performerDetails: document.getElementById('performer-details'),
+    performerHeading: document.getElementById('performer-heading'),
+    performerCount: document.getElementById('performer-selection-count'),
+    performerAll: document.getElementById('performer-select-all'),
+    performerEntries: document.getElementById('performer-entries'),
     resourceKind: document.getElementById('resource-kind'),
     parsedTitle: document.getElementById('parsed-title'),
     videoMeta: document.getElementById('video-meta'),
@@ -56,6 +62,8 @@
     queueStatus: document.getElementById('queue-status'),
     queueToggle: document.getElementById('queue-toggle'),
     queueList: document.getElementById('queue-list'),
+    downloadTaskHistory: document.getElementById('download-task-history'),
+    downloadTaskList: document.getElementById('download-task-list'),
     progressCard: document.querySelector('.progress-card'),
     cancelButton: document.getElementById('cancel-button'),
     failedDownloads: document.getElementById('failed-downloads'),
@@ -65,6 +73,8 @@
   };
 
   let parsedResource = null;
+  let performerChecks = [];
+  let selectedItemIndices = [];
   let concurrencyOptions = null;
   let batchVideoConcurrency = '';
   let directory = '';
@@ -73,6 +83,7 @@
   let activeTaskId = null;
   let activeDownloadResource = null;
   const queuedTasks = [];
+  const downloadTasks = new Map();
   const queueRows = new Map();
   const cancellingQueuedTasks = new Set();
   let queueExpanded = false;
@@ -93,11 +104,24 @@
   let parseGeneration = 0;
   let composingUrl = false;
   let pendingDownloadEvents = [];
+  let pendingProgress = null;
+  let progressFrame = null;
+  const changedProgressItems = new Set();
+  let activeVideoRows = new Map();
   let sessionRevision = 0;
   let latestAuthRevision = -1;
   const kindNames = { video: '单视频', playlist: '片单', pornstar: '色情明星视频' };
+  const downloadStates = {
+    queued: '排队等待', downloading: '正在下载', retry: '等待重试', cancelling: '正在取消',
+    completed: '下载完成', partial: '部分完成', failed: '下载失败', cancelled: '已取消',
+  };
+  const terminalDownloadStates = ['completed', 'partial', 'failed', 'cancelled'];
   const concurrencySettingsKey = 'porngo.downloadConcurrency';
   const urlHelpText = '支持 Pornhub 视频、片单和明星视频页（HTTP/HTTPS）';
+
+  function setText(element, text) {
+    if (element.textContent !== text) element.textContent = text;
+  }
 
   function configureConcurrency(options) {
     const selectors = [
@@ -170,12 +194,16 @@
         const row = document.createElement('div');
         row.className = 'download-list-row queue-row';
         const title = document.createElement('span');
-        title.className = 'text-ellipsis';
+        title.className = 'queue-row-title';
         const remove = document.createElement('button');
         remove.type = 'button';
         remove.className = 'button button-outline queue-row-remove';
         remove.addEventListener('click', () => removeQueuedTask(task.taskId));
         row.append(title, remove);
+        if (task.items.size) {
+          task.view = createTaskDetails(task, true);
+          row.append(task.view.details);
+        }
         elements.queueList.append(row);
         controls = { row, title, remove };
         queueRows.set(task.taskId, controls);
@@ -198,6 +226,136 @@
         : !elements.cancelButton.disabled ? elements.cancelButton : elements.progressStatus;
       target.focus();
     }
+  }
+
+  function createTaskDetails(task, queued = false) {
+    const details = document.createElement('details');
+    details.className = 'download-task-details';
+    const summary = document.createElement('summary');
+    const title = document.createElement('span');
+    title.className = 'download-task-title';
+    const status = document.createElement('span');
+    status.className = 'download-task-status';
+    const disclosure = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    disclosure.setAttribute('class', 'ui-icon ui-icon--chevron-down download-task-summary-icon');
+    disclosure.setAttribute('aria-hidden', 'true');
+    const disclosureUse = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    disclosureUse.setAttribute('href', '#icon-chevron-down');
+    disclosure.append(disclosureUse);
+    summary.append(title, status, disclosure);
+    const error = document.createElement('p');
+    error.className = 'download-task-error';
+    error.hidden = true;
+    const items = document.createElement('ul');
+    items.className = 'download-task-items';
+    details.append(summary, error, items);
+    const view = { details, summary, title, status, error, items, rows: new Map() };
+    if (queued) {
+      title.textContent = `视频明细 · ${task.items.size} 条`;
+      status.hidden = true;
+    }
+    details.addEventListener('toggle', () => {
+      if (!details.open || view.rows.size) return;
+      for (const item of task.items.values()) renderTaskItem(view, item);
+    });
+    return view;
+  }
+
+  function renderTaskItem(view, item) {
+    if (!view) return;
+    let controls = view.rows.get(item.itemIndex);
+    if (!controls) {
+      if (!view.details.open) return;
+      const row = document.createElement('li');
+      const title = document.createElement('strong');
+      const status = document.createElement('span');
+      status.className = 'download-task-status';
+      const progress = document.createElement('progress');
+      progress.max = 100;
+      const error = document.createElement('span');
+      error.className = 'download-task-error';
+      const file = document.createElement('span');
+      file.className = 'download-task-file';
+      row.append(title, status, progress, error, file);
+      view.items.append(row);
+      controls = { title, status, progress, error, file };
+      view.rows.set(item.itemIndex, controls);
+    }
+    setText(controls.title, `${item.itemIndex}. ${item.title || '未命名视频'}`);
+    controls.status.dataset.state = item.state;
+    const percent = Number.isFinite(item.percent) ? Math.round(item.percent) : null;
+    setText(controls.status, [downloadStates[item.state], percent === null ? '' : `${percent}%`,
+      item.attempt > 1 ? `第 ${item.attempt}/${item.maxAttempts} 次尝试` : '',
+      item.speed, item.eta ? `剩余 ${item.eta}` : ''].filter(Boolean).join(' · '));
+    controls.progress.hidden = percent === null || item.state !== 'downloading';
+    if (!controls.progress.hidden) {
+      controls.progress.value = percent;
+      controls.progress.setAttribute('aria-label', `${item.title || '未命名视频'}的下载进度`);
+    }
+    setText(controls.error, item.error || '');
+    controls.error.hidden = !item.error;
+    setText(controls.file, item.fileName || '');
+    controls.file.hidden = !item.fileName || item.fileName === item.title;
+  }
+
+  function renderTaskSummary(task) {
+    const { view } = task;
+    const count = task.items.size || task.resource.entryCount;
+    const showPercent = Number.isFinite(task.percent)
+      && (!terminalDownloadStates.includes(task.state) || task.state === 'completed');
+    const videoTitle = task.resource.kind === 'video' ? task.items.get(1)?.title : '';
+    setText(view.title, videoTitle || task.resource.title || '未命名下载任务');
+    view.status.dataset.state = task.state;
+    setText(view.status, [task.retry ? '重新下载' : '', downloadStates[task.state],
+      count > 0 ? `${count} 条` : '', showPercent ? `${Math.round(task.percent)}%` : '',
+      task.counts].filter(Boolean).join(' · '));
+    setText(view.error, task.error || '');
+    view.error.hidden = !task.error;
+  }
+
+  function addTaskToHistory(task) {
+    const row = document.createElement('li');
+    const hadFocus = task.view && document.activeElement === task.view.summary;
+    task.view ||= createTaskDetails(task);
+    task.view.status.hidden = false;
+    renderTaskSummary(task);
+    row.append(task.view.details);
+    elements.downloadTaskList.append(row);
+    elements.downloadTaskHistory.hidden = false;
+    if (hadFocus) task.view.summary.focus();
+  }
+
+  function updateTaskDetails(task, event, deferProgress = false) {
+    const item = event.itemUpdate;
+    if (item && task.items.has(item.itemIndex)) {
+      const previous = task.items.get(item.itemIndex);
+      const next = { ...item, title: item.title || previous.title };
+      task.items.set(item.itemIndex, next);
+      if (task.view?.rows.has(next.itemIndex)) {
+        if (deferProgress) changedProgressItems.add(next.itemIndex);
+        else renderTaskItem(task.view, next);
+      }
+    }
+    if (Number.isFinite(event.percent)) task.percent = event.percent;
+    if (task.items.size > 1) task.counts = batchCounts(event);
+    if (terminalDownloadStates.includes(event.type)) {
+      task.state = event.type;
+      task.error = ['failed', 'partial', 'cancelled'].includes(event.type) ? event.message : '';
+      for (const item of task.items.values()) {
+        if (terminalDownloadStates.includes(item.state)) continue;
+        item.state = event.type === 'partial' ? 'failed' : event.type;
+        item.speed = '';
+        item.eta = '';
+        if (item.state === 'failed') item.error = event.message;
+        if (item.state === 'completed') item.percent = 100;
+        if (task.view?.rows.has(item.itemIndex)) renderTaskItem(task.view, item);
+      }
+    } else if (task.state !== 'cancelling' && ['progress', 'retry'].includes(event.type)) {
+      const active = Array.isArray(event.activeVideos) ? event.activeVideos.length : event.activeCount;
+      task.state = (active === 0 && event.retryCount > 0) || (event.type === 'retry' && !active)
+        ? 'retry' : 'downloading';
+    }
+    if (!deferProgress && task.view && task.state !== 'queued') renderTaskSummary(task);
   }
 
   async function removeQueuedTask(taskId) {
@@ -273,6 +431,7 @@
     elements.fragmentConcurrency.disabled = !concurrencyOptions;
     elements.videoConcurrency.disabled = !concurrencyOptions || !parsedResource || parsedResource.kind === 'video';
     elements.downloadButton.disabled = !concurrencyOptions || !parsedResource || !directory
+      || (parsedResource.kind === 'pornstar' && !selectedItemIndices.length)
       || !elements.formatSelect.value || parsing || submittingDownload;
     elements.downloadLabel.textContent = submittingDownload ? '正在加入…'
       : downloadWork ? '加入下载队列' : '开始下载';
@@ -470,7 +629,50 @@
     }
   }
 
+  function updatePerformerSelection() {
+    selectedItemIndices = performerChecks.flatMap((checkbox, index) => checkbox.checked ? [index + 1] : []);
+    const total = performerChecks.length;
+    const count = selectedItemIndices.length;
+    elements.performerAll.checked = total > 0 && count === total;
+    elements.performerAll.indeterminate = count > 0 && count < total;
+    elements.performerCount.textContent = `已选 ${count} / ${total} 条`;
+    updateControls();
+  }
+
+  function showPerformerEntries(entries) {
+    elements.performerHeading.append(elements.videoDetails);
+    performerChecks = entries.map((entry) => {
+      const row = document.createElement('label');
+      row.className = 'performer-entry';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = true;
+      const copy = document.createElement('span');
+      const title = document.createElement('strong');
+      title.textContent = entry.title;
+      const url = document.createElement('span');
+      url.className = 'performer-url';
+      url.textContent = entry.url;
+      copy.append(title, url);
+      row.append(checkbox, copy);
+      elements.performerEntries.append(row);
+      return checkbox;
+    });
+    elements.performerDetails.open = true;
+    elements.performerDetails.hidden = false;
+    elements.performerCount.hidden = false;
+    updatePerformerSelection();
+  }
+
   function clearResource() {
+    if (parsedResource?.kind === 'pornstar') {
+      elements.videoPreview.append(elements.videoDetails);
+      elements.performerDetails.hidden = true;
+      elements.performerCount.hidden = true;
+      elements.performerEntries.replaceChildren();
+      performerChecks = [];
+      selectedItemIndices = [];
+    }
     parsedResource = null;
     setVideoConcurrency();
     elements.mainColumn.classList.remove('has-resource');
@@ -481,7 +683,7 @@
     elements.parsedTitle.textContent = '';
     elements.videoMeta.textContent = '';
     elements.resourceKind.textContent = '已解析的内容';
-    elements.thumbnailPlaceholder.textContent = '▶';
+    elements.thumbnailPlaceholder.classList.remove('is-batch');
     elements.thumbnail.removeAttribute('src');
     elements.thumbnail.hidden = true;
     elements.thumbnailPlaceholder.hidden = false;
@@ -496,10 +698,10 @@
     const isBatch = resource.kind === 'playlist' || resource.kind === 'pornstar';
     setVideoConcurrency();
     elements.resourceKind.textContent = `已解析的${kind}`;
-    elements.thumbnailPlaceholder.textContent = isBatch ? '▤' : '▶';
+    elements.thumbnailPlaceholder.classList.toggle('is-batch', isBatch);
     elements.parsedTitle.textContent = typeof resource.title === 'string' && resource.title.trim() ? resource.title : `未命名${kind}`;
     const count = Number(resource.entryCount);
-    const details = [kind, isBatch && Number.isInteger(count) ? `${count} 条视频` : '',
+    const details = [kind, resource.kind === 'playlist' && Number.isInteger(count) ? `${count} 条视频` : '',
       resource.id ? `ID ${String(resource.id)}` : '', !isBatch ? formatDuration(resource.duration) : ''].filter(Boolean);
     elements.videoMeta.textContent = details.join(' · ');
 
@@ -520,6 +722,7 @@
       elements.formatSelect.append(option);
     }
     elements.videoEmpty.hidden = true;
+    if (resource.kind === 'pornstar') showPerformerEntries(resource.entries);
     elements.videoDetails.hidden = false;
     elements.formatRow.hidden = false;
     elements.concurrencyCard.hidden = false;
@@ -531,18 +734,18 @@
     const bounded = Number.isFinite(numeric) ? Math.max(0, Math.min(100, numeric)) : 0;
     elements.progressEmpty.hidden = true;
     elements.progressContent.hidden = false;
-    elements.progressStatus.textContent = status;
-    elements.progressPercent.textContent = `${Math.round(bounded)}%`;
+    setText(elements.progressStatus, status);
+    setText(elements.progressPercent, `${Math.round(bounded)}%`);
     elements.progressFill.style.width = `${bounded}%`;
     elements.progressTrack.setAttribute('aria-valuenow', String(Math.round(bounded)));
-    elements.progressDetail.textContent = detail;
+    setText(elements.progressDetail, detail);
   }
 
   function setProgressItem(event) {
     const resource = activeDownloadResource;
     if (!resource || resource.kind === 'video') {
       elements.progressItem.hidden = true;
-      elements.progressItem.textContent = '';
+      setText(elements.progressItem, '');
       return;
     }
     const activeVideos = Array.isArray(event && event.activeVideos)
@@ -552,7 +755,7 @@
       // Concurrent workers report progress independently. Keep the headline steady
       // instead of replacing it with whichever video's event arrived last; the
       // ordered rows below carry each video's live title, speed, and ETA.
-      elements.progressItem.textContent = `当前并发下载：${activeVideos.length} 条视频`;
+      setText(elements.progressItem, `当前并发下载：${activeVideos.length} 条视频`);
       elements.progressItem.hidden = false;
       return;
     }
@@ -571,7 +774,7 @@
     const maxAttempts = Number(event && event.maxAttempts);
     const retry = Number.isInteger(attempt) && attempt > 1 && Number.isInteger(maxAttempts)
       ? ` · 第 ${attempt}/${maxAttempts} 次尝试` : '';
-    elements.progressItem.textContent = title ? `${position} · ${title}${retry}` : `${position}${retry}`;
+    setText(elements.progressItem, title ? `${position} · ${title}${retry}` : `${position}${retry}`);
     elements.progressItem.hidden = false;
   }
 
@@ -667,6 +870,27 @@
     updateControls();
   }
 
+  function loadInitialAccountState() {
+    if (typeof api.credentialsStatus === 'function') {
+      const initialCredentialsRevision = credentialsRevision;
+      api.credentialsStatus().then((result) => {
+        if (credentialsRevision === initialCredentialsRevision) setCredentialsStatus(result);
+      }).catch((error) => {
+        if (credentialsRevision !== initialCredentialsRevision) return;
+        showNotice(`读取保存的账号密码失败：${errorMessage(error)}`, 'error');
+      });
+    }
+    const initialSessionRevision = sessionRevision;
+    api.sessionStatus().then((result) => {
+      if (sessionRevision === initialSessionRevision) applySessionStatus(result);
+    }).catch((error) => {
+      if (sessionRevision !== initialSessionRevision) return;
+      elements.sessionLabel.textContent = '无法读取会话';
+      elements.sessionSummary.textContent = '无法读取';
+      showNotice(`读取会话失败：${errorMessage(error)}`, 'error');
+    });
+  }
+
   async function changeCredentials(action) {
     if (!api || credentialsBusy || loginBusy || hasDownloadWork() || !credentialsReady) return;
     if (action !== 'delete' && (!credentialsAvailable || !loginWindowOpen)) return;
@@ -721,6 +945,9 @@
       if ((resource.kind === 'playlist' || resource.kind === 'pornstar') && Number(resource.entryCount) <= 0) {
         throw new Error('没有找到可下载的视频。');
       }
+      if (resource.kind === 'pornstar' && (!Array.isArray(resource.entries) || resource.entries.length !== resource.entryCount)) {
+        throw new Error('明星视频列表不完整，请重新解析。');
+      }
       if (typeof resource.snapshotId !== 'string' || !resource.snapshotId) throw new Error('无法识别解析结果，请重新解析。');
       showResource(resource);
     } catch (error) {
@@ -755,6 +982,8 @@
   function activateDownload(task) {
     activeTaskId = task.taskId;
     activeDownloadResource = task.resource;
+    task.state = 'downloading';
+    addTaskToHistory(task);
     cancelling = false;
     setProgress(0, '正在下载', '正在连接媒体服务器…');
     setProgressItem();
@@ -770,6 +999,7 @@
     if (!api || !concurrencyOptions || !parsedResource || !directory || !elements.formatSelect.value
         || parsing || submittingDownload) return;
     const resource = parsedResource;
+    if (resource.kind === 'pornstar' && !selectedItemIndices.length) return;
     const request = {
       snapshotId: resource.snapshotId,
       formatId: elements.formatSelect.value,
@@ -777,7 +1007,12 @@
       videoConcurrency: resource.kind === 'video' ? concurrencyOptions.video[0] : Number(batchVideoConcurrency),
       directory,
     };
-    await submitDownload(request, resource);
+    if (resource.kind === 'pornstar') {
+      request.itemIndices = selectedItemIndices;
+      await submitDownload(request, { kind: resource.kind, title: resource.title, entryCount: selectedItemIndices.length });
+    } else {
+      await submitDownload(request, resource);
+    }
   }
 
   async function submitDownload(request, resource, retry = false) {
@@ -793,7 +1028,11 @@
       const task = await (retry ? api.retryDownload(request) : api.download(request));
       if (!task || typeof task.taskId !== 'string' || !task.taskId) throw new Error('下载任务未能启动。');
       applyFailedBatch(task.failedBatch);
-      queuedTasks.push({ taskId: task.taskId, resource });
+      const items = new Map((task.items || []).map((item) => [item.itemIndex, { ...item, state: 'queued' }]));
+      const { kind, title, entryCount } = resource;
+      const downloadTask = { taskId: task.taskId, resource: { kind, title, entryCount }, retry, items, state: 'queued' };
+      downloadTasks.set(task.taskId, downloadTask);
+      queuedTasks.push(downloadTask);
       const earlyEvents = pendingDownloadEvents.filter((event) => event.taskId === task.taskId);
       if (task.queued && earlyEvents.length === 0) {
         showNotice('已加入下载队列，前方还有 ' + Math.max(0, Number(task.queuePosition) - 1) + ' 个任务。', 'success');
@@ -814,9 +1053,14 @@
   async function cancelDownload() {
     const taskId = activeTaskId;
     if (!api || !taskId || cancelling) return;
+    flushDownloadProgress();
     const previousStatus = elements.progressStatus.textContent;
     const previousDetail = elements.progressDetail.textContent;
+    const task = downloadTasks.get(taskId);
+    const previousTaskState = task.state;
     cancelling = true;
+    task.state = 'cancelling';
+    renderTaskSummary(task);
     elements.progressStatus.textContent = '正在取消';
     elements.progressDetail.textContent = '正在停止下载任务…';
     updateControls();
@@ -826,6 +1070,8 @@
     } catch (error) {
       if (activeTaskId !== taskId) return;
       cancelling = false;
+      task.state = previousTaskState;
+      renderTaskSummary(task);
       elements.progressStatus.textContent = previousStatus;
       elements.progressDetail.textContent = previousDetail;
       showNotice(`取消下载失败：${errorMessage(error)}`, 'error');
@@ -834,33 +1080,56 @@
   }
 
   function renderActiveVideos(videos) {
-    if (!Array.isArray(videos) || videos.length === 0) {
-      elements.progressVideos.replaceChildren();
-      elements.progressVideos.hidden = true;
-      return;
-    }
-    const rows = videos.filter((video) => Number.isInteger(video.itemIndex) && video.itemIndex > 0)
-      .map((video) => {
+    const nextRows = new Map();
+    for (const video of videos) {
+      if (!Number.isInteger(video.itemIndex) || video.itemIndex < 1) continue;
+      let controls = activeVideoRows.get(video.itemIndex);
+      if (!controls) {
         const row = document.createElement('div');
         row.className = 'download-list-row progress-video';
         row.setAttribute('role', 'listitem');
         const title = document.createElement('span');
-        title.className = 'progress-video-title text-ellipsis';
-        title.textContent = `第 ${video.itemIndex} 条 · ${typeof video.title === 'string' && video.title.trim() ? video.title : '未命名视频'}`;
+        title.className = 'progress-video-title';
         const speed = document.createElement('span');
         speed.className = 'progress-video-speed';
-        speed.textContent = typeof video.speed === 'string' && video.speed ? video.speed : '测速中…';
-        row.append(title, speed);
-        if (typeof video.eta === 'string' && video.eta) {
-          const eta = document.createElement('span');
-          eta.className = 'progress-video-eta';
-          eta.textContent = `剩余 ${video.eta}`;
-          row.append(eta);
-        }
-        return row;
-      });
-    elements.progressVideos.replaceChildren(...rows);
+        const eta = document.createElement('span');
+        eta.className = 'progress-video-eta';
+        row.append(title, speed, eta);
+        controls = { row, title, speed, eta };
+      }
+      const title = typeof video.title === 'string' && video.title.trim() ? video.title : '未命名视频';
+      const speed = typeof video.speed === 'string' && video.speed ? video.speed : '测速中…';
+      const eta = typeof video.eta === 'string' && video.eta ? `剩余 ${video.eta}` : '';
+      setText(controls.title, `第 ${video.itemIndex} 条 · ${title}`);
+      setText(controls.speed, speed);
+      setText(controls.eta, eta);
+      if (controls.eta.hidden !== !eta) controls.eta.hidden = !eta;
+      nextRows.set(video.itemIndex, controls);
+    }
+    const children = elements.progressVideos.children;
+    const rows = [...nextRows.values()].map(({ row }) => row);
+    if (children.length !== rows.length || rows.some((row, index) => children[index] !== row)) {
+      elements.progressVideos.replaceChildren(...rows);
+    }
     elements.progressVideos.hidden = rows.length === 0;
+    activeVideoRows = nextRows;
+  }
+
+  function paintDownloadProgress() {
+    progressFrame = null;
+    if (!pendingProgress) return;
+    const event = pendingProgress;
+    pendingProgress = null;
+    const task = downloadTasks.get(event.taskId);
+    for (const itemIndex of changedProgressItems) renderTaskItem(task.view, task.items.get(itemIndex));
+    changedProgressItems.clear();
+    if (task.view) renderTaskSummary(task);
+    if (!cancelling) renderDownloadActivity(event);
+  }
+
+  function flushDownloadProgress() {
+    if (progressFrame !== null) window.cancelAnimationFrame(progressFrame);
+    paintDownloadProgress();
   }
 
   function onDownloadEvent(event) {
@@ -870,20 +1139,29 @@
       if (queuedIndex >= 0) {
         if (event.type === 'started' && !activeTaskId) {
           const [task] = queuedTasks.splice(queuedIndex, 1);
+          task.percent = event.percent;
           activateDownload(task);
           return;
-        } else if (['completed', 'partial', 'failed', 'cancelled'].includes(event.type)) {
-          queuedTasks.splice(queuedIndex, 1);
+        } else if (terminalDownloadStates.includes(event.type)) {
+          const [task] = queuedTasks.splice(queuedIndex, 1);
+          updateTaskDetails(task, event);
+          addTaskToHistory(task);
           applyFailedBatch(event.failedBatch);
           updateControls();
           return;
         } else {
           return;
         }
-      } else if (submittingDownload) {
+      } else if (submittingDownload && !downloadTasks.has(event.taskId)) {
         if (event.type === 'progress') {
-          pendingDownloadEvents = pendingDownloadEvents.filter((pending) =>
-            pending.taskId !== event.taskId || pending.type !== 'progress');
+          const item = event.itemUpdate;
+          pendingDownloadEvents = pendingDownloadEvents.filter((pending) => {
+            if (pending.taskId !== event.taskId || pending.type !== 'progress') return true;
+            const earlier = pending.itemUpdate;
+            if (!earlier || !item) return Boolean(earlier || item);
+            return earlier.state !== 'downloading' || item.state !== 'downloading'
+              || earlier.itemIndex !== item.itemIndex || earlier.attempt !== item.attempt;
+          });
         }
         pendingDownloadEvents.push(event);
         return;
@@ -891,7 +1169,27 @@
         return;
       }
     }
-    if (event.type === 'started' || (cancelling && ['progress', 'retry'].includes(event.type))) return;
+    if (event.type === 'started') return;
+    const task = downloadTasks.get(event.taskId);
+    const periodicProgress = event.type === 'progress'
+      && (!event.itemUpdate || event.itemUpdate.state === 'downloading');
+    if (periodicProgress && typeof window.requestAnimationFrame === 'function') {
+      // Keep the latest state of every item, while painting at most once per frame.
+      updateTaskDetails(task, event, true);
+      pendingProgress = event;
+      if (progressFrame === null) progressFrame = window.requestAnimationFrame(paintDownloadProgress);
+      return;
+    }
+    flushDownloadProgress();
+    updateTaskDetails(task, event);
+    if (event.type === 'progress' || event.type === 'retry') {
+      if (!cancelling) renderDownloadActivity(event);
+    } else {
+      finishDownload(event);
+    }
+  }
+
+  function renderDownloadActivity(event) {
     if (Array.isArray(event.activeVideos)) renderActiveVideos(event.activeVideos);
     const speed = typeof event.speed === 'string' ? event.speed : '';
     const eta = typeof event.eta === 'string' ? event.eta : '';
@@ -916,16 +1214,15 @@
       setProgressItem(event);
       return;
     }
-    if (event.type === 'retry') {
-      const status = hasActivitySummary && activeCount > 0 ? '正在下载' : '等待重试';
-      const retryDetailText = hasActivitySummary
-        ? [detail, activeCount > 0 ? '失败项已加入重试队列' : '等待重试任务启动'].filter(Boolean).join(' · ')
-        : event.message || '已加入队列末尾。';
-      setProgress(event.percent, status, retryDetailText);
-      setProgressItem(event);
-      return;
-    }
+    const status = hasActivitySummary && activeCount > 0 ? '正在下载' : '等待重试';
+    const retryDetailText = hasActivitySummary
+      ? [detail, activeCount > 0 ? '失败项已加入重试队列' : '等待重试任务启动'].filter(Boolean).join(' · ')
+      : event.message || '已加入队列末尾。';
+    setProgress(event.percent, status, retryDetailText);
+    setProgressItem(event);
+  }
 
+  function finishDownload(event) {
     const batch = activeDownloadResource?.kind !== 'video';
     const counts = batch ? batchCounts(event) : '';
     if (event.type === 'completed') {
@@ -993,6 +1290,11 @@
     elements.urlInput.focus();
   });
   elements.formatSelect.addEventListener('change', updateControls);
+  elements.performerAll.addEventListener('change', () => {
+    for (const checkbox of performerChecks) checkbox.checked = elements.performerAll.checked;
+    updatePerformerSelection();
+  });
+  elements.performerEntries.addEventListener('change', updatePerformerSelection);
   elements.fragmentConcurrency.addEventListener('change', saveConcurrencySettings);
   elements.videoConcurrency.addEventListener('change', saveConcurrencySettings);
   elements.directoryButton.addEventListener('click', selectDirectory);
@@ -1031,19 +1333,10 @@
       sessionRevision++;
     });
   }
-  if (typeof api.credentialsStatus === 'function') {
-    if (typeof api.onCredentialsChanged === 'function') {
-      api.onCredentialsChanged((result) => {
-        credentialsRevision++;
-        setCredentialsStatus(result);
-      });
-    }
-    const initialCredentialsRevision = credentialsRevision;
-    api.credentialsStatus().then((result) => {
-      if (credentialsRevision === initialCredentialsRevision) setCredentialsStatus(result);
-    }).catch((error) => {
-      if (credentialsRevision !== initialCredentialsRevision) return;
-      showNotice(`读取保存的账号密码失败：${errorMessage(error)}`, 'error');
+  if (typeof api.credentialsStatus === 'function' && typeof api.onCredentialsChanged === 'function') {
+    api.onCredentialsChanged((result) => {
+      credentialsRevision++;
+      setCredentialsStatus(result);
     });
   }
   elements.directoryLabel.textContent = '正在读取保存目录…';
@@ -1059,13 +1352,10 @@
     directoryLoading = false;
     updateControls();
   });
-  const initialSessionRevision = sessionRevision;
-  api.sessionStatus().then((result) => {
-    if (sessionRevision === initialSessionRevision) applySessionStatus(result);
-  }).catch((error) => {
-    if (sessionRevision !== initialSessionRevision) return;
-    elements.sessionLabel.textContent = '无法读取会话';
-    elements.sessionSummary.textContent = '无法读取';
-    showNotice(`读取会话失败：${errorMessage(error)}`, 'error');
-  });
+  if (typeof window.requestAnimationFrame === 'function') {
+    // The form and its handlers are ready before opening the saved account session.
+    window.requestAnimationFrame(() => setTimeout(loadInitialAccountState, 0));
+  } else {
+    loadInitialAccountState();
+  }
 })();

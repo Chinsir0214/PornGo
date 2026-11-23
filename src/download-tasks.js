@@ -5,7 +5,6 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { MAX_DOWNLOAD_ATTEMPTS, validateDownloadConcurrency, processDownloadQueue: processQueue } = require('./download-queue');
 const { validateDownloadDirectory: validateDirectory } = require('./download-directory');
-const { terminateProcessTree: terminateTree } = require('./download-process');
 const { formatExpression } = require('./pornhub');
 
 function safeFolderName(value) {
@@ -16,9 +15,11 @@ function safeFolderName(value) {
 function createDownloadTasks({
   getSnapshot, emitDownload, createCookieFile, resolveVideoTitle, downloadOne,
   validateDownloadDirectory = validateDirectory, mkdir = makeDirectory,
-  processDownloadQueue = processQueue, terminateProcessTree = terminateTree, createTaskId = randomUUID,
+  processDownloadQueue = processQueue, cancelRunning, createTaskId = randomUUID,
 }) {
   let activeDownload = null;
+  let closing = false;
+  let activeFinished;
   const pendingDownloads = [];
   const retryableDownloads = new Map();
   let enqueueDownload = Promise.resolve();
@@ -26,7 +27,7 @@ function createDownloadTasks({
   function createTask({ videos, ...settings }) {
     return {
       ...settings, taskId: createTaskId(), videos: videos.map((video) => ({ ...video })),
-      cookieFile: null, children: new Set(), cancelled: false, cancelOperations: Promise.resolve(),
+      cookieFile: null, cancelled: false, cancelOperations: Promise.resolve(),
       completedCount: 0, failedCount: 0, percent: 0,
     };
   }
@@ -45,26 +46,30 @@ function createDownloadTasks({
         download: async ({ item, reportProgress }) => {
           await resolveVideoTitle(item.video, task);
           if (task.cancelled) return null;
-          reportProgress(0);
+          reportProgress();
           return downloadOne(task, item, reportProgress);
         },
-        onProgress: ({ item: { video, index, attempt }, percent, details }) => {
+        onProgress: ({ item: { video, index, attempt }, percent, itemPercent, details }) => {
           task.percent = percent;
-          activeVideos.set(index, {
+          const previous = activeVideos.get(index);
+          const activeVideo = {
             itemIndex: index + 1, title: video.title,
-            speed: typeof details.speed === 'string' ? details.speed : activeVideos.get(index)?.speed || '',
-            eta: typeof details.eta === 'string' ? details.eta : activeVideos.get(index)?.eta || '',
-          });
+            speed: details.speed ?? previous?.speed ?? '', eta: details.eta ?? previous?.eta ?? '',
+            percent: itemPercent ?? previous?.percent,
+          };
+          activeVideos.set(index, activeVideo);
           emitDownload({
             taskId: task.taskId, type: 'progress', ...details,
             percent, itemIndex: index + 1, itemCount: task.videos.length,
             currentTitle: video.title, attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
             retryCount: details.retryCount, activeVideos: activeVideoSnapshot(),
+            itemUpdate: { ...activeVideo, state: 'downloading', attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS },
           });
         },
         onStart: ({ item: { video, index, attempt }, percent, activeCount, retryCount }) => {
           task.percent = percent;
-          activeVideos.set(index, { itemIndex: index + 1, title: video.title, speed: '', eta: '' });
+          const activeVideo = { itemIndex: index + 1, title: video.title, speed: '', eta: '' };
+          activeVideos.set(index, activeVideo);
           emitDownload({
             taskId: task.taskId, type: 'progress',
             percent, activeCount,
@@ -73,6 +78,7 @@ function createDownloadTasks({
             currentTitle: video.title, completedCount: task.completedCount,
             failedCount: task.failedCount, attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
             activeVideos: activeVideoSnapshot(),
+            itemUpdate: { ...activeVideo, state: 'downloading', attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS },
           });
         },
         onRetry: ({ item: { video, index, attempt }, error, percent, activeCount, retryCount }) => {
@@ -85,18 +91,25 @@ function createDownloadTasks({
             currentTitle: video.title, completedCount: task.completedCount,
             failedCount: task.failedCount, attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
             activeVideos: activeVideoSnapshot(),
+            itemUpdate: { itemIndex: index + 1, title: video.title, state: 'retry',
+              error: String(error), attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS },
           });
         },
-        onSettled: ({ item: { index }, error, completedCount, failedCount, percent, retryCount }) => {
+        onSettled: ({ item: { index, attempt }, error, completedCount, failedCount, percent, retryCount }) => {
           settledItems.add(index);
           if (error) failedItems.set(index, String(error));
+          const previous = activeVideos.get(index);
           activeVideos.delete(index);
           task.completedCount = completedCount;
           task.failedCount = failedCount;
           task.percent = percent;
           emitDownload({ taskId: task.taskId, type: 'progress', percent,
             completedCount, failedCount, activeCount: activeVideos.size,
-            retryCount, itemCount: task.videos.length, activeVideos: activeVideoSnapshot() });
+            retryCount, itemCount: task.videos.length, activeVideos: activeVideoSnapshot(),
+            itemUpdate: { itemIndex: index + 1, title: task.videos[index].title,
+              state: error ? 'failed' : 'completed', error: error ? String(error) : '',
+              percent: error ? previous?.percent : 100, attempt, maxAttempts: MAX_DOWNLOAD_ATTEMPTS,
+              fileName: task.videos[index].downloadFileName } });
         },
       });
       await task.cancelOperations;
@@ -169,23 +182,37 @@ function createDownloadTasks({
     const queuePosition = pendingDownloads.length + (activeDownload ? 1 : 0);
     // Capture pending rows before a fast retry can finish.
     const failedBatch = task.retryBatchId ? failedBatchSnapshot(retryableDownloads.get(task.retryBatchId)) : null;
+    const items = task.videos.map((video, index) => ({ itemIndex: index + 1, title: video.title }));
     pumpDownloadQueue();
-    return { taskId: task.taskId, queued: activeDownload !== task, queuePosition, failedBatch };
+    return { taskId: task.taskId, queued: activeDownload !== task, queuePosition, failedBatch, items };
   }
 
   function pumpDownloadQueue() {
-    if (activeDownload || pendingDownloads.length === 0) return;
+    if (closing || activeDownload || pendingDownloads.length === 0) return;
     const task = pendingDownloads.shift();
     activeDownload = task;
     emitDownload({ taskId: task.taskId, type: 'started',
       itemCount: task.videos.length, currentTitle: task.title, percent: 0 });
-    void runDownloadTask(task);
+    activeFinished = runDownloadTask(task);
   }
 
   async function prepareDownload(request) {
     if (!request || typeof request !== 'object') throw new Error('下载参数无效。');
     const parsed = getSnapshot(request.snapshotId);
     if (!parsed) throw new Error('解析结果已失效，请重新解析这个页面再下载。');
+    let videos = parsed.videos;
+    if (request.itemIndices !== undefined) {
+      const indices = request.itemIndices;
+      if (parsed.kind !== 'pornstar' || !Array.isArray(indices) || !indices.length || indices.length > videos.length) {
+        throw new Error('请选择当前明星页面中的有效视频。');
+      }
+      const selected = new Set(indices);
+      if (selected.size !== indices.length || [...selected].some((index) =>
+        !Number.isInteger(index) || index < 1 || index > videos.length)) {
+        throw new Error('请选择当前明星页面中的有效视频。');
+      }
+      videos = videos.filter((_video, index) => selected.has(index + 1));
+    }
     let directory = await validateDownloadDirectory(request.directory);
     const format = formatExpression(request.formatId);
     const { fragmentConcurrency, videoConcurrency } = validateDownloadConcurrency(
@@ -196,7 +223,7 @@ function createDownloadTasks({
       await mkdir(directory, { recursive: true });
     }
     return enqueueTask(createTask({
-      kind: parsed.kind, title: parsed.title, videos: parsed.videos,
+      kind: parsed.kind, title: parsed.title, videos,
       directory, format, formatId: request.formatId, fragmentConcurrency, videoConcurrency,
     }));
   }
@@ -223,7 +250,10 @@ function createDownloadTasks({
   }
 
   function serializeSubmission(prepare, request) {
-    const result = enqueueDownload.then(() => prepare(request));
+    const result = enqueueDownload.then(() => {
+      if (closing) throw new Error('应用正在退出。');
+      return prepare(request);
+    });
     enqueueDownload = result.catch(() => {});
     return result;
   }
@@ -234,7 +264,7 @@ function createDownloadTasks({
       if (task.cancelled) return task.cancelOperations;
       task.cancelled = true;
       task.titleAbortController?.abort();
-      task.cancelOperations = Promise.allSettled([...task.children].map(terminateProcessTree));
+      task.cancelOperations = cancelRunning(task.taskId);
       return task.cancelOperations;
     }
     return removeQueuedDownload(taskId);
@@ -255,6 +285,13 @@ function createDownloadTasks({
     startDownload: (request) => serializeSubmission(prepareDownload, request),
     retryDownload: (request) => serializeSubmission(prepareRetry, request),
     cancelDownload, removeQueuedDownload,
+    async close() {
+      closing = true;
+      if (activeDownload) cancelDownload(activeDownload.taskId);
+      await enqueueDownload;
+      pendingDownloads.length = 0;
+      await activeFinished;
+    },
   };
 }
 

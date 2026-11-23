@@ -1,13 +1,12 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, Menu, session, safeStorage } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, session, safeStorage, utilityProcess } = require('electron');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { FRAGMENT_CONCURRENCY, VIDEO_CONCURRENCY } = require('./download-queue');
-const { runDownloadProcess } = require('./download-process');
+const { createDownloadWorker } = require('./download-worker-client');
 const { loadDownloadDirectory, saveDownloadDirectory } = require('./download-directory');
 const { createResourceParser } = require('./resource-parser');
 const { createDownloadTasks } = require('./download-tasks');
@@ -15,7 +14,7 @@ const { inspectSiteLoginState, createRevisionGate, startStatusPolling, resolveOb
 const { createCredentialStore } = require('./credential-store');
 const { readWindowCredentials, fillWindowCredentials } = require('./login-credentials');
 const {
-  isSiteHost, isSiteCookie, serializeCookies, explainYtdlpError,
+  isSiteHost, isSiteCookie, serializeCookies,
 } = require('./pornhub');
 
 const AUTH_PARTITION = 'persist:porngo-auth';
@@ -23,9 +22,9 @@ const APP_USER_MODEL_ID = 'com.porngo.app';
 const ICON_PATH = app.isPackaged
   ? path.join(process.resourcesPath, 'assets', 'icon-0.9.2.ico')
   : path.join(__dirname, '..', 'assets', 'icon-0.9.2.ico');
-const MAX_METADATA_BYTES = 64 * 1024 * 1024;
 let mainWindow = null;
 let loginWindow = null;
+let configuredAuthSession = null;
 let loginWindowRevision = 0;
 let clearingSession = false;
 const authRevision = createRevisionGate();
@@ -36,6 +35,7 @@ let loginCloseApproved = false;
 
 app.setName('PornGo');
 app.setPath('userData', path.join(app.getPath('appData'), 'PornGo'));
+Menu.setApplicationMenu(null);
 const credentialStore = createCredentialStore({
   filePath: path.join(app.getPath('userData'), 'login-credentials.json'), safeStorage,
 });
@@ -54,7 +54,14 @@ function setWindowAppDetails(win) {
 }
 
 function authSession() {
-  return session.fromPartition(AUTH_PARTITION);
+  if (!configuredAuthSession) {
+    const auth = session.fromPartition(AUTH_PARTITION);
+    auth.setUserAgent(auth.getUserAgent().replace(/\sElectron\/[^\s]+/, ''));
+    auth.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    auth.on('will-download', (event) => event.preventDefault());
+    configuredAuthSession = auth;
+  }
+  return configuredAuthSession;
 }
 
 function assertMainFrame(event) {
@@ -209,7 +216,7 @@ function openLogin() {
     autoHideMenuBar: true,
     backgroundColor: '#ffffff',
     webPreferences: {
-      partition: AUTH_PARTITION,
+      session: authSession(),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
@@ -380,20 +387,15 @@ function resolveTool(name) {
   return candidates.find((candidate) => fs.existsSync(candidate)) || executable;
 }
 
-function ytDlpLaunchError(error) {
-  if (error.code === 'ENOENT') {
-    return app.isPackaged
-      ? '安装包缺少 yt-dlp。请重新安装包含下载工具的完整版本。'
-      : '未找到 yt-dlp。请在 PornGo 目录运行 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1，然后重启应用。';
+let toolPaths;
+function toolSettings(cookieFile) {
+  if (!toolPaths) {
+    const ffmpeg = resolveTool('ffmpeg');
+    toolPaths = { binary: resolveTool('yt-dlp'), ffmpegDir: fs.existsSync(ffmpeg) ? path.dirname(ffmpeg) : null };
   }
-  return `无法启动 yt-dlp：${error.message}`;
-}
-
-function baseYtdlpArgs(cookieFile) {
   const args = ['--no-check-formats', '--cookies', cookieFile, '--user-agent', authSession().getUserAgent()];
-  const ffmpeg = resolveTool('ffmpeg');
-  if (fs.existsSync(ffmpeg)) args.push('--ffmpeg-location', path.dirname(ffmpeg));
-  return args;
+  if (toolPaths.ffmpegDir) args.push('--ffmpeg-location', toolPaths.ffmpegDir);
+  return { binary: toolPaths.binary, baseArgs: args, packaged: app.isPackaged };
 }
 
 async function createCookieFile() {
@@ -407,37 +409,6 @@ async function createCookieFile() {
     await fsp.rm(dir, { recursive: true, force: true });
     throw error;
   }
-}
-
-function captureProcess(binary, args, maxBytes = MAX_METADATA_BYTES) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, { windowsHide: true, shell: false });
-    const stdoutChunks = [];
-    let stdoutBytes = 0;
-    let stderr = '';
-    let settled = false;
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      reject(error);
-    };
-    child.stdout.on('data', (chunk) => {
-      stdoutChunks.push(chunk);
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > maxBytes) {
-        child.kill();
-        fail(new Error('页面视频信息过大，已停止解析。'));
-      }
-    });
-    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString('utf8')).slice(-4000); });
-    child.on('error', (error) => fail(new Error(ytDlpLaunchError(error))));
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      if (code === 0) resolve(Buffer.concat(stdoutChunks).toString('utf8'));
-      else reject(new Error(explainYtdlpError(stderr, `yt-dlp 退出，代码 ${code}。`)));
-    });
-  });
 }
 
 async function fetchSitePage(url, { attempts = 3, timeoutMs = 30000, signal } = {}) {
@@ -459,18 +430,21 @@ async function fetchSitePage(url, { attempts = 3, timeoutMs = 30000, signal } = 
   throw new Error(`内嵌网页无法读取页面：${lastError.message || lastError}`);
 }
 
-async function captureMetadata(resource, batch) {
-  const cookieFile = await createCookieFile();
-  try {
-    return await captureProcess(resolveTool('yt-dlp'), [
-      ...baseYtdlpArgs(cookieFile.file),
-      batch ? '--yes-playlist' : '--no-playlist',
-      ...(batch ? ['--flat-playlist'] : []),
-      '--dump-single-json', '--skip-download', resource.url,
-    ]);
-  } finally {
-    await cookieFile.cleanup();
-  }
+const downloadWorker = createDownloadWorker(() => utilityProcess.fork(
+  path.join(__dirname, 'download-worker.js'), [], { serviceName: 'PornGo Downloads', stdio: 'ignore' },
+));
+const pendingMetadata = new Set();
+let quitting = false;
+
+function captureMetadata(resource, batch) {
+  if (quitting) throw new Error('应用正在退出。');
+  const operation = createCookieFile().then(async (cookieFile) => {
+    try {
+      return await downloadWorker.request('metadata', { ...toolSettings(cookieFile.file), url: resource.url, batch });
+    } finally { await cookieFile.cleanup(); }
+  });
+  pendingMetadata.add(operation);
+  return operation.finally(() => pendingMetadata.delete(operation));
 }
 
 const resourceParser = createResourceParser({ fetchSitePage, captureMetadata });
@@ -481,15 +455,18 @@ function emitDownload(event) {
   }
 }
 
-function downloadOne(task, item, reportProgress) {
-  return runDownloadProcess(task, item, reportProgress, {
-    binary: resolveTool('yt-dlp'), baseArgs: baseYtdlpArgs(task.cookieFile.file), launchError: ytDlpLaunchError,
-  });
+async function downloadOne(task, { video }, reportProgress) {
+  const result = await downloadWorker.request('download', {
+    ...toolSettings(task.cookieFile.file), video: { url: video.url, downloadTitle: video.downloadTitle },
+    directory: task.directory, format: task.format, fragmentConcurrency: task.fragmentConcurrency,
+  }, { group: task.taskId, progress: reportProgress });
+  if (result.fileName) video.downloadFileName = result.fileName;
+  return result.error;
 }
 
 const downloadTasks = createDownloadTasks({
   getSnapshot: resourceParser.getSnapshot, resolveVideoTitle: resourceParser.resolveVideoTitle,
-  emitDownload, createCookieFile, downloadOne,
+  emitDownload, createCookieFile, downloadOne, cancelRunning: downloadWorker.cancel,
 });
 
 function registerIpc() {
@@ -532,11 +509,6 @@ function registerIpc() {
 }
 
 app.whenReady().then(() => {
-  Menu.setApplicationMenu(null);
-  const ses = authSession();
-  ses.setUserAgent(ses.getUserAgent().replace(/\sElectron\/[^\s]+/, ''));
-  ses.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
-  ses.on('will-download', (event) => event.preventDefault());
   registerIpc();
   createMainWindow();
   app.on('activate', () => {
@@ -546,4 +518,16 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
+});
+
+let shutdownComplete = false;
+app.on('before-quit', (event) => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  Promise.allSettled([downloadTasks.close(), downloadWorker.close(), ...pendingMetadata]).then(() => {
+    shutdownComplete = true;
+    app.quit();
+  });
 });

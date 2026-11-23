@@ -7,7 +7,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-function rendererHarness(download, retryDownload, { autoStart = true, cancel } = {}) {
+function rendererHarness(download, retryDownload, { autoStart = true, cancel, parseResource } = {}) {
   const elements = new Map();
   function element(key) {
     if (!elements.has(key)) {
@@ -43,11 +43,11 @@ function rendererHarness(download, retryDownload, { autoStart = true, cancel } =
   const api = {
     getDirectory: async () => path.join(__dirname, '..', 'downtest'),
     sessionStatus: async () => ({ cookieCount: 0 }),
-    parse: async (url) => url.endsWith('/first')
+    parse: parseResource || (async (url) => url.endsWith('/first')
       ? { kind: 'playlist', snapshotId: 'first-snapshot', title: 'First list', entryCount: 3,
         formats: [{ id: 'best', label: 'Best' }] }
       : { kind: 'video', snapshotId: 'second-snapshot', title: 'Second video',
-        formats: [{ id: 'best', label: 'Best' }] },
+        formats: [{ id: 'best', label: 'Best' }] }),
     download: async (request) => {
       requests.push(request);
       return startUnqueued(await download(request, requests.length));
@@ -59,7 +59,12 @@ function rendererHarness(download, retryDownload, { autoStart = true, cancel } =
     onDownloadEvent: (callback) => { emit = callback; },
     onLoginClosed: () => {},
   };
-  const document = { getElementById: element, querySelector: element, createElement: () => element(Symbol()) };
+  const document = {
+    getElementById: element,
+    querySelector: element,
+    createElement: () => element(Symbol()),
+    createElementNS: (_namespace, name) => element(Symbol(name)),
+  };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer.js'), 'utf8'), {
     window: { porngo: api },
     document,
@@ -73,6 +78,49 @@ async function parse(harness, url) {
   harness.element('video-url').handlers.input();
   await harness.element('parse-form').handlers.submit({ preventDefault() {} });
 }
+
+test('performer selections survive collapsing, block empty submissions and reset for the next parse', async () => {
+  const entries = ['One', 'Two', 'Three'].map((title) => ({ title, url: `https://example.test/${title}` }));
+  const harness = rendererHarness(() => ({ taskId: 'selection-task' }), undefined, {
+    parseResource: async (url) => ({
+      snapshotId: 'selection', title: 'Test', formats: [{ id: 'best' }],
+      ...(url.endsWith('/star') ? { kind: 'pornstar', entryCount: entries.length, entries } : { kind: 'video' }),
+    }),
+  });
+  const { element, requests } = harness;
+  await new Promise(setImmediate);
+  await parse(harness, 'https://example.test/star');
+  const list = element('performer-entries');
+  const details = element('performer-details');
+  const all = element('performer-select-all');
+  assert.equal(details.open, true);
+  assert.equal(all.checked, true);
+  assert.equal(list.children[1].children[1].children[1].textContent, entries[1].url);
+  list.children[1].children[0].checked = false;
+  list.handlers.change();
+  assert.equal(all.indeterminate, true);
+  details.open = false;
+  assert.equal(element('performer-selection-count').textContent, '已选 2 / 3 条');
+  await element('download-button').handlers.click();
+  assert.deepEqual(Array.from(requests[0].itemIndices), [1, 3]);
+  details.open = true;
+  assert.equal(list.children[1].children[0].checked, false);
+  all.checked = false;
+  all.handlers.change();
+  assert.equal(list.children.every((row) => !row.children[0].checked), true);
+  assert.equal(all.indeterminate, false);
+  assert.equal(element('download-button').disabled, true);
+  await element('download-button').handlers.click();
+  assert.equal(requests.length, 1);
+  all.checked = true;
+  all.handlers.change();
+  assert.equal(list.children.every((row) => row.children[0].checked), true);
+  assert.equal(element('download-button').disabled, false);
+  await parse(harness, 'https://example.test/video');
+  assert.equal(details.hidden, true);
+  assert.equal(list.children.length, 0);
+  assert.equal(element('video-details').parent, element('video-preview'));
+});
 
 test('a second link can be parsed and queued while the first download continues', async () => {
   const harness = rendererHarness((_request, index) => ({
@@ -293,5 +341,66 @@ test('rejected retry submission keeps selected failures available', async () => 
   assert.equal(failedCheckbox(failedGroup(harness), 0).disabled, false);
   assert.equal(failedGroup(harness).children[4].disabled, false);
   assert.match(harness.element('notice-message').textContent, /folder missing/);
+});
+
+test('download details preserve per-video updates before an IPC reply and when another task starts', async () => {
+  let resolveFirst;
+  const harness = rendererHarness((_request, index) => index === 1
+    ? new Promise((resolve) => { resolveFirst = resolve; })
+    : { taskId: 'task-2', queued: true, queuePosition: 2, items: [{ itemIndex: 1, title: 'Queued video' }] },
+  undefined, { autoStart: false });
+  const { element, emit } = harness;
+  const maxAttempts = 3;
+  const sendFirst = (type, itemUpdate, details) => emit({ taskId: 'task-1', type, itemUpdate, ...details });
+  await new Promise(setImmediate);
+  await parse(harness, 'https://www.pornhub.com/first');
+  const pending = element('download-button').handlers.click();
+  sendFirst('started', undefined, { percent: 0 });
+  sendFirst('progress', { itemIndex: 1, state: 'completed', percent: 100, fileName: 'A [123].mp4' });
+  sendFirst('retry', { itemIndex: 2, state: 'retry', error: 'interrupted', attempt: 2, maxAttempts });
+  sendFirst('progress', { itemIndex: 3, state: 'failed', error: 'unavailable', attempt: 3, maxAttempts });
+  resolveFirst({ taskId: 'task-1', queued: false, items: ['A', 'B', 'C'].map((title, index) => ({ itemIndex: index + 1, title })) });
+  await pending;
+
+  const list = element('download-task-list');
+  const first = list.children[0].children[0];
+  const status = first.children[0].children[1];
+  first.open = true;
+  first.handlers.toggle();
+  const rows = first.children[2].children.map((row) => row.children);
+  assert.deepEqual(rows.map(([title]) => title.textContent), ['1. A', '2. B', '3. C']);
+  assert.match(rows[0][1].textContent, /下载完成.*100%/);
+  assert.equal(rows[0][4].textContent, 'A [123].mp4');
+  assert.match(rows[1][1].textContent, /等待重试.*第 2\/3 次尝试/);
+  assert.equal(rows[1][3].textContent, 'interrupted');
+  assert.equal(rows[2][3].textContent, 'unavailable');
+
+  sendFirst('progress', { itemIndex: 2, state: 'downloading', percent: 40,
+    speed: '1MiB/s', eta: '00:08', attempt: 2, maxAttempts }, { percent: 65 });
+  assert.match(status.textContent, /正在下载.*65%/);
+  assert.match(rows[1][1].textContent, /40%.*1MiB\/s.*00:08/);
+  assert.equal(rows[1][2].value, 40);
+  assert.equal(rows[1][3].hidden, true);
+
+  await parse(harness, 'https://www.pornhub.com/second');
+  await element('download-button').handlers.click();
+  element('queue-toggle').handlers.click();
+  const queued = element('queue-list').children[0].children[2];
+  queued.open = true;
+  queued.handlers.toggle();
+  assert.equal(queued.children[2].children[0].children[0].textContent, '1. Queued video');
+  assert.equal(queued.children[2].children[0].children[1].textContent, '排队等待');
+  queued.children[0].focus();
+
+  sendFirst('progress', { itemIndex: 2, state: 'completed', percent: 100, attempt: 2, maxAttempts });
+  sendFirst('partial', undefined, { percent: 100, completedCount: 2, failedCount: 1 });
+  emit({ taskId: 'task-2', type: 'started' });
+  assert.equal(list.children.length, 2);
+  assert.equal(list.children[1].children[0], queued);
+  assert.equal(queued.open, true);
+  assert.equal(harness.document.activeElement, queued.children[0]);
+  assert.match(status.textContent, /部分完成.*成功 2 条，失败 1 条/);
+  assert.match(rows[1][1].textContent, /下载完成/);
+  assert.equal(rows[2][3].textContent, 'unavailable');
 });
 

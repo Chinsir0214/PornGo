@@ -22,7 +22,7 @@ function mainQueueHarness(overrides = {}) {
     processDownloadQueue: (videos, callbacks) => new Promise((resolve) => { runs.push({ resolve, callbacks, videos }); }),
     downloadOne: (task) => Promise.resolve(task),
     resolveVideoTitle: async () => {},
-    terminateProcessTree: async () => {},
+    cancelRunning: async () => {},
     emitDownload: (event) => events.push(event),
     createTaskId: () => 'task-' + ++nextId,
     ...overrides,
@@ -35,6 +35,32 @@ const request = (snapshotId) => ({
   fragmentConcurrency: 1, videoConcurrency: 1,
 });
 const flush = () => new Promise(setImmediate);
+
+test('closing the queue aborts active work, waits for cookie cleanup and never starts a waiting batch', async () => {
+  const cancelled = [];
+  let cleanups = 0;
+  let finishCleanup;
+  const queue = mainQueueHarness({
+    cancelRunning: async (id) => { cancelled.push(id); },
+    createCookieFile: async () => ({ file: 'test', cleanup: async () => {
+      cleanups++;
+      await new Promise((resolve) => { finishCleanup = resolve; });
+    } }),
+  });
+  const first = await queue.startDownload(request('snapshot-a'));
+  await queue.startDownload(request('snapshot-b'));
+  let closed = false;
+  const closing = queue.close().then(() => { closed = true; });
+  await assert.rejects(queue.startDownload(request('snapshot-a')), /退出/);
+  assert.deepEqual(cancelled, [first.taskId]);
+  queue.runs[0].resolve({ failures: [] });
+  await flush();
+  assert.equal(cleanups, 1);
+  assert.equal(closed, false);
+  finishCleanup();
+  await closing;
+  assert.equal(queue.runs.length, 1);
+});
 
 test('main process queues a parsed resource and retains it after its snapshot is evicted', async () => {
   const queue = mainQueueHarness();
@@ -137,6 +163,32 @@ function settleRun(run, outcomes) {
   run.resolve({ failures: failures.slice(0, 3) });
 }
 
+test('performer submissions validate the selection and preserve snapshot order for downloads and retries', async () => {
+  const queue = mainQueueHarness();
+  const videos = ['One', 'Two', 'Three'].map((title) => ({ title, url: `https://example.test/${title}` }));
+  queue.parsedResources.set('star', { kind: 'pornstar', id: 'star', title: 'Star', videos });
+  for (const itemIndices of [[], [0], [4], [2, 2], ['1'], [1.5], new Array(1), null]) {
+    await assert.rejects(queue.startDownload({ ...request('star'), itemIndices }), /请选择/);
+  }
+  await assert.rejects(queue.startDownload({ ...request('snapshot-a'), itemIndices: [1] }), /请选择/);
+  assert.equal(queue.runs.length, 0);
+  const task = await queue.startDownload({ ...request('star'), itemIndices: [3, 1] });
+  await flush();
+  assert.deepEqual(queue.runs[0].videos, [videos[0], videos[2]]);
+  settleRun(queue.runs[0], [null, 'failed']);
+  await flush();
+  assert.equal(queue.events.at(-1).itemCount, 2);
+  await queue.retryDownload({ taskId: task.taskId, itemIndices: [2] });
+  await flush();
+  assert.deepEqual(queue.runs[1].videos, [videos[2]]);
+  settleRun(queue.runs[1], [null]);
+  await flush();
+  await queue.startDownload(request('star'));
+  await flush();
+  assert.deepEqual(queue.runs[2].videos, videos);
+  settleRun(queue.runs[2], [null, null, null]);
+});
+
 test('all final failures retain their original settings and retry only selected videos after cache changes', async () => {
   const queue = mainQueueHarness();
   const snapshotId = 'snapshot-a';
@@ -220,6 +272,35 @@ test('setup failures expose every unsuccessful video and cancelled tasks expose 
   cancelled.runs[0].resolve({ failures: [] });
   await flush();
   assert.equal(cancelled.events.at(-1).failedBatch, null);
+});
+
+test('task events expose real per-video progress, retry errors and completed filenames', async () => {
+  const queue = mainQueueHarness({
+    processDownloadQueue: undefined,
+    downloadOne: async (_task, item, reportProgress) => {
+      reportProgress(40, { speed: '2MiB/s', eta: '00:10' });
+      if (item.index === 1) return 'Connection dropped';
+      item.video.downloadFileName = 'A [123].mp4';
+      return null;
+    },
+  });
+  queue.parsedResources.set('playlist', { kind: 'playlist', id: '12', title: 'Two videos',
+    videos: [{ title: 'A' }, { title: 'B' }] });
+  const task = await queue.startDownload(request('playlist'));
+  await flush();
+  assert.deepEqual(task.items, [{ itemIndex: 1, title: 'A' }, { itemIndex: 2, title: 'B' }]);
+  const updates = queue.events.map(({ itemUpdate }) => itemUpdate).filter(Boolean);
+  const live = updates.find((item) => item.percent === 40);
+  assert.equal(live.state, 'downloading');
+  assert.equal(live.speed, '2MiB/s');
+  assert.equal(live.eta, '00:10');
+  assert.equal(queue.events.find((event) => event.itemUpdate === live).percent, 20);
+  assert.equal(updates.find((item) => item.state === 'completed').fileName, 'A [123].mp4');
+  assert.deepEqual(updates.filter((item) => item.state === 'retry').map(({ attempt, error }) => [attempt, error]),
+    [[2, 'Connection dropped'], [3, 'Connection dropped']]);
+  assert.equal(updates.at(-1).state, 'failed');
+  assert.equal(updates.at(-1).error, 'Connection dropped');
+  assert.equal(queue.events.at(-1).type, 'partial');
 });
 
 test('disjoint retries produce increasing revisions when an earlier retry finishes before the next reply arrives', async () => {

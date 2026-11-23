@@ -132,21 +132,27 @@ test('aggregate progress is monotonic while concurrent attempts and retries comp
 
 test('queue reports progress and settlement to its callbacks in order', async () => {
   const events = [];
-  await processDownloadQueue(['video'], {
+  await processDownloadQueue(['video', 'another'], {
     onStart: ({ activeCount }) => events.push(['start', activeCount]),
-    download: ({ reportProgress }) => {
-      reportProgress(50, { speed: '1MiB/s' });
+    download: ({ item, reportProgress }) => {
+      if (item.index === 0) {
+        reportProgress();
+        reportProgress(50, { speed: '1MiB/s' });
+      }
       return null;
     },
-    onProgress: ({ percent, details: { speed, activeCount, itemCount } }) =>
-      events.push(['progress', percent, speed, activeCount, itemCount]),
+    onProgress: ({ percent, itemPercent, details: { speed, activeCount, itemCount } }) =>
+      events.push(['progress', percent, itemPercent, speed, activeCount, itemCount]),
     onSettled: ({ completedCount, failedCount, activeCount }) =>
       events.push(['settled', completedCount, failedCount, activeCount]),
   });
   assert.deepEqual(events, [
     ['start', 1],
-    ['progress', 50, '1MiB/s', 1, 1],
+    ['progress', 0, undefined, undefined, 1, 2],
+    ['progress', 25, 50, '1MiB/s', 1, 2],
     ['settled', 1, 0, 0],
+    ['start', 1],
+    ['settled', 2, 0, 0],
   ]);
 });
 

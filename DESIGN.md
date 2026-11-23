@@ -62,7 +62,9 @@ Segoe UI supplies the light Windows-style display headings; Microsoft YaHei UI a
 
 ## Layout
 
-The desktop uses a broad work column and a narrow account/progress column with a 12px tile gap. The dark 54px application header is also the draggable window titlebar, with native-sized window actions at its right edge. The default 1060 × 780 window keeps the primary workflow visible without scrolling; the minimum window is 980 × 780. Tile padding and the live tile are compact so the workflow retains its sequence in the available height. Once content is parsed, the introductory panel gives way to the full content and quality controls. Longer notices, metadata, and active batch progress can scroll naturally. Progress, thumbnail, and directory surfaces reserve their dimensions as content arrives.
+The desktop divides the work and account/progress columns in a 3:2 ratio with a 12px tile gap. The dark 54px application header is also the draggable window titlebar, with native-sized window actions at its right edge. The default window is 1060 × 780 and the minimum is 980 × 780. Tile padding and the live tile are compact so the workflow retains its sequence in the available height. Once content is parsed, the introductory panel gives way to the full content and quality controls.
+
+Live video rows place the title, speed, and time remaining on one line when their content fits. The timing metrics move below the title in narrow cards. Download history and failed items appear below the work and status columns, sharing the row when both have enough space. Long lists scroll within their tiles, and long titles, paths, and messages wrap. At narrower viewports the account and progress tiles move below the workflow and stack when the available width can no longer fit both.
 
 The compact download-concurrency tile appears after parsing in the space released by the introduction. Its two native selectors independently control fragment concurrency for one video and video concurrency for batches. Both default to one connection or worker so comparisons begin from the original behavior. The video selector is disabled for a single video; the fragment selector remains available for every content type.
 
@@ -98,7 +100,7 @@ Simple text glyphs and geometric marks support labels; they do not replace actio
 
 ### Motion
 
-Startup uses a brief rotating-dot indicator and tile pivot entrance. The live tile cycles calmly between supported content types. Busy actions spin until their operation ends; progress and session states breathe only while active. All motion stops under `prefers-reduced-motion`.
+Startup shows the workspace as soon as its first frame is ready, with a brief slide that keeps the tiles visible throughout. The live tile cycles calmly between supported content types. Busy actions spin until their operation ends; progress and session states breathe only while active. All motion stops under `prefers-reduced-motion`.
 
 ### Content and data visualization
 

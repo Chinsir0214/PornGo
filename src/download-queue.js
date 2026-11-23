@@ -54,7 +54,8 @@ async function processDownloadQueue(videos, {
         if (isCancelled()) return;
         const bounded = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
         activeProgress.set(key, Math.max(activeProgress.get(key) || 0, bounded));
-        onProgress({ item, percent: progress(), details: { ...details, completedCount, failedCount,
+        onProgress({ item, percent: progress(), itemPercent: Number.isFinite(percent) ? activeProgress.get(key) : undefined,
+          details: { ...details, completedCount, failedCount,
           activeCount: activeProgress.size, itemCount: videos.length, retryCount } });
       };
       let error;

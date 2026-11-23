@@ -1,12 +1,12 @@
 {
   "name": "porn-go",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "private": true,
   "description": "Desktop video downloader with an embedded website sign-in window.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/pornhub.js && node --check src/auth-status.js && node --check src/credential-store.js && node --check src/login-credentials.js && node --check src/download-queue.js && node --check src/download-process.js && node --check src/download-artifact.js && node --check src/download-directory.js && node --check src/download-tasks.js && node --check src/resource-parser.js && node --check src/playlist.js && node --check src/renderer.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/pornhub.js && node --check src/auth-status.js && node --check src/credential-store.js && node --check src/login-credentials.js && node --check src/download-queue.js && node --check src/download-worker.js && node --check src/download-worker-client.js && node --check src/download-process.js && node --check src/download-artifact.js && node --check src/download-directory.js && node --check src/download-tasks.js && node --check src/resource-parser.js && node --check src/playlist.js && node --check src/renderer.js",
     "test": "node --test test/*.test.js",
     "verify:tools": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1 -VerifyOnly",
     "dist": "npm run verify:tools && electron-builder --win",

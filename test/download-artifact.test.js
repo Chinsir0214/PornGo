@@ -105,10 +105,9 @@ function downloadHarness({ timeError = null } = {}) {
   };
   const task = { kind: 'pornstar', directory: 'downloads', cookieFile: { file: 'cookies' },
     fragmentConcurrency: 4, children: new Set() };
-  return { task, calls, timeCalls,
-    run: (index = 0) => runDownloadProcess(task, {
-      index, video: { url: 'https://www.pornhub.com/view_video.php?viewkey=ph1234' },
-    }, () => {}, options),
+  const video = { url: 'https://www.pornhub.com/view_video.php?viewkey=ph1234' };
+  return { task, video, calls, timeCalls,
+    run: (index = 0) => runDownloadProcess(task, { index, video }, () => {}, options),
     child: () => child,
   };
 }
@@ -126,6 +125,7 @@ test('main waits until successful postprocessing ends before setting the final f
   harness.child().emit('close', 0);
   assert.equal(await pending, null);
   assert.deepEqual(harness.timeCalls, [{ record, directory: 'downloads' }]);
+  assert.equal(harness.video.downloadFileName, '中文 [ph1234].mp4');
   assert.equal(harness.task.children.size, 0);
   const firstTemplate = harness.calls[0][harness.calls[0].indexOf('-o') + 1];
   harness.task.kind = 'video';
@@ -144,6 +144,7 @@ test('failed downloads never change file time and time failures are returned to 
   harness.child().emit('close', 1);
   assert.match(await pending, /下载失败/);
   assert.equal(harness.timeCalls.length, 0);
+  assert.equal(harness.video.downloadFileName, undefined);
   const failing = downloadHarness({ timeError: 'write denied' });
   const failed = failing.run();
   failing.child().stdout.emit('data', Buffer.from(FILE_METADATA_PREFIX + JSON.stringify(record) + '\n'));

@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createResourceParser } = require('../src/resource-parser');
+const { createResourceParser, readMetadata } = require('../src/resource-parser');
 const { normalizeResourceUrl, chineseTitleLanguage, videoTitlesFromHtml, preferredVideoTitle } = require('../src/pornhub');
 
 const url = 'https://www.pornhub.com/view_video.php?viewkey=ph1234';
@@ -149,13 +149,31 @@ test('failed or cancelled lookups leave the existing title usable by the downloa
 test('single video parsing uses the selected title for returned content and remembered download metadata', async () => {
   const parser = createResourceParser({
     fetchSitePage: async () => page('cn', '简体标题'),
-    captureMetadata: async () => JSON.stringify({ id: resource.id, title: 'English displayed title', duration: 123 }),
+    captureMetadata: async () => readMetadata(JSON.stringify({ id: resource.id, title: 'English displayed title', duration: 123 }), false),
   });
   const parsed = await parser.parse(url);
   const remembered = parser.getSnapshot(parsed.snapshotId);
   assert.equal(parsed.title, '简体标题');
   assert.equal(remembered.title, '简体标题');
   assert.equal(remembered.videos[0].downloadTitle, '简体标题');
+});
+
+test('performer entries match the downloadable snapshot after unsupported links are skipped', async () => {
+  const parser = createResourceParser({
+    fetchSitePage: async () => '',
+    captureMetadata: async () => readMetadata(JSON.stringify({ title: 'Performer', entries: [
+      { id: 'first123', title: 'First entry' },
+      { url: 'https://example.test/removed' },
+      { id: 'second456', title: 'Second entry' },
+    ] }), true),
+  });
+  const parsed = await parser.parse('https://www.pornhub.com/model/performer');
+  assert.equal(parsed.entryCount, 2);
+  assert.deepEqual(parsed.entries, [
+    { title: 'First entry', url: 'https://www.pornhub.com/view_video.php?viewkey=first123' },
+    { title: 'Second entry', url: 'https://www.pornhub.com/view_video.php?viewkey=second456' },
+  ]);
+  assert.deepEqual(parsed.entries, parser.getSnapshot(parsed.snapshotId).videos);
 });
 
 test('overlapping parses of the same resource retain their own results until evicted', async () => {
@@ -165,12 +183,12 @@ test('overlapping parses of the same resource retain their own results until evi
     fetchSitePage: async () => '',
     captureMetadata: () => {
       if (++requests === 1) return new Promise((resolve) => { finishFirst = resolve; });
-      return Promise.resolve(JSON.stringify({ id: resource.id, title: 'New title' }));
+      return Promise.resolve({ id: resource.id, title: 'New title' });
     },
   });
   const first = parser.parse(url);
   const newer = await parser.parse(cnUrl);
-  finishFirst(JSON.stringify({ id: resource.id, title: 'Old title' }));
+  finishFirst({ id: resource.id, title: 'Old title' });
   const older = await first;
   assert.notEqual(newer.snapshotId, older.snapshotId);
   assert.equal(parser.getSnapshot(newer.snapshotId).videos[0].title, 'New title');

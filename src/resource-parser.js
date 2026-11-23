@@ -30,6 +30,23 @@ function batchEntries(info) {
   return videos;
 }
 
+function readMetadata(output, batch) {
+  let info;
+  try { info = JSON.parse(output); }
+  catch { throw new Error('yt-dlp 返回的页面信息无法解析。'); }
+  if (!info || typeof info !== 'object') throw new Error('没有取得有效的页面信息。');
+  const thumbnail = typeof info.thumbnail === 'string' && info.thumbnail.startsWith('https://')
+    ? info.thumbnail : undefined;
+  if (batch) {
+    const videos = batchEntries(info);
+    if (!videos.length) throw new Error('此页面未找到可下载视频。请确认网页内容可见，再重新解析。');
+    return { title: String(info.title || ''), thumbnail, videos };
+  }
+  if (!info.id || !info.title) throw new Error('没有取得有效的视频信息。');
+  return { id: String(info.id), title: String(info.title), thumbnail,
+    duration: Number.isFinite(info.duration) ? info.duration : undefined, formats: formatsFromInfo(info) };
+}
+
 function createResourceParser({ fetchSitePage, captureMetadata }) {
   // The latest five completed results stay valid for this application session.
   const snapshots = new Map();
@@ -44,7 +61,8 @@ function createResourceParser({ fetchSitePage, captureMetadata }) {
   function batchSnapshot(resource, title, videos, thumbnail) {
     const snapshotId = remember({ ...resource, title, videos });
     return { snapshotId, kind: resource.kind, id: resource.id, title, thumbnail,
-      entryCount: videos.length, formats: BATCH_FORMATS };
+      entryCount: videos.length, formats: BATCH_FORMATS,
+      ...(resource.kind === 'pornstar' && { entries: videos.map(({ title, url }) => ({ title, url })) }) };
   }
 
   async function resolveVideoTitle(video, task) {
@@ -66,18 +84,10 @@ function createResourceParser({ fetchSitePage, captureMetadata }) {
       return batchSnapshot(resource, title, videos);
     }
     const batch = resource.kind !== 'video';
-    const output = await captureMetadata(resource, batch);
-    let info;
-    try { info = JSON.parse(output); }
-    catch { throw new Error('yt-dlp 返回的页面信息无法解析。'); }
-    if (!info || typeof info !== 'object') {
-      throw new Error('没有取得有效的页面信息。');
-    }
-    const thumbnail = typeof info.thumbnail === 'string' && info.thumbnail.startsWith('https://')
-      ? info.thumbnail : undefined;
+    const info = await captureMetadata(resource, batch);
+    const { thumbnail } = info;
     if (batch) {
-      const videos = batchEntries(info);
-      if (!videos.length) throw new Error('此页面未找到可下载视频。请确认网页内容可见，再重新解析。');
+      const { videos } = info;
       let title = String(info.title || `${resource.id} 的视频`);
       if (resource.kind === 'pornstar') {
         const html = await fetchSitePage(resource.url).catch(() => '');
@@ -85,16 +95,14 @@ function createResourceParser({ fetchSitePage, captureMetadata }) {
       }
       return batchSnapshot(resource, title, videos, thumbnail);
     }
-    if (!info.id || !info.title) throw new Error('没有取得有效的视频信息。');
     const video = { url: resource.url, title: String(info.title) };
     await resolveVideoTitle(video);
     const snapshotId = remember({ ...resource, title: video.title, videos: [video] });
     return { snapshotId, kind: 'video', id: String(info.id), title: video.title, thumbnail,
-      duration: Number.isFinite(info.duration) ? info.duration : undefined,
-      formats: formatsFromInfo(info) };
+      duration: info.duration, formats: info.formats };
   }
 
   return { parse, getSnapshot: (snapshotId) => snapshots.get(snapshotId), resolveVideoTitle };
 }
 
-module.exports = { createResourceParser };
+module.exports = { createResourceParser, readMetadata };
