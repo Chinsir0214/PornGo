@@ -15,7 +15,7 @@ const {
 } = require('../src/download-artifact');
 
 test('all downloads use the same title and ID filename without a list position', () => {
-  const args = artifactYtdlpArgs('downloads');
+  const args = artifactYtdlpArgs(process.platform === 'win32' ? 'C:\\dl' : '/dl');
   assert.equal(args[args.indexOf('-o') + 1], '%(title).180B [%(id)s].%(ext)s');
   assert.ok(!args.includes('--replace-in-metadata'));
   assert.ok(args.includes('--no-overwrites'));
@@ -144,18 +144,43 @@ test('failed downloads never change file time and time failures are returned to 
   harness.child().emit('close', 1);
   assert.match(await pending, /下载失败/);
   assert.equal(harness.timeCalls.length, 0);
-  assert.equal(harness.video.downloadFileName, undefined);
+  assert.equal(harness.video.downloadFileName, 'sample.mp4');
   const failing = downloadHarness({ timeError: 'write denied' });
   const failed = failing.run();
   failing.child().stdout.emit('data', Buffer.from(FILE_METADATA_PREFIX + JSON.stringify(record) + '\n'));
   failing.child().emit('close', 0);
-  assert.match(await failed, /设置发布时间失败：write denied/);
+  assert.deepEqual(await failed, { message: '视频已下载，但设置发布时间失败：write denied', retryable: false });
 });
 
 test('a successful child without a final file record reports the metadata failure', async () => {
   const harness = downloadHarness();
   const pending = harness.run();
   harness.child().emit('close', 0);
-  assert.match(await pending, /未取得最终文件信息/);
+  const error = await pending;
+  assert.match(error.message, /未取得最终文件信息/);
+  assert.equal(error.retryable, false);
   assert.equal(harness.timeCalls.length, 0);
 });
+
+test('Windows timestamps accept case differences and extended-length paths', async () => {
+  const directory = 'C:\\Downloads';
+  const filepath = '\\\\?\\c:\\DOWNLOADS\\clip.mp4';
+  let updated;
+  await applyPublicationTime({ filepath, upload_date: '20240924' }, directory, {
+    platform: 'win32',
+    fs: {
+      realpath: async (name) => name,
+      stat: async () => ({ isFile: () => true, atime: new Date(0) }),
+      utimes: async (name) => { updated = name; },
+    },
+  });
+  assert.equal(updated, filepath);
+});
+
+test('Windows title budget shrinks beyond the path threshold with a 40 byte floor',
+  { skip: process.platform !== 'win32' }, () => {
+    for (const [length, bytes] of [[42, 180], [43, 179], [183, 40]]) {
+      const args = artifactYtdlpArgs('C:\\' + 'a'.repeat(length - 3));
+      assert.equal(args.at(-1), '%(title).' + bytes + 'B [%(id)s].%(ext)s');
+    }
+  });

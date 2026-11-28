@@ -1,10 +1,9 @@
 'use strict';
 
 const fs = require('node:fs/promises');
-const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createAsyncQueue, atomicWriteFile } = require('./atomic-file');
 
-const CREDENTIAL_ORIGINS = new Set(['https://www.pornhub.com', 'https://pornhub.com']);
+const CREDENTIAL_ORIGINS = new Set(['https://www.pornhub.com', 'https://pornhub.com', 'https://cn.pornhub.com']);
 
 function isCredentialOrigin(origin) {
   return typeof origin === 'string' && CREDENTIAL_ORIGINS.has(origin);
@@ -18,20 +17,27 @@ function validCredential(value) {
 }
 
 function createCredentialStore({ filePath, safeStorage }) {
-  let pending = Promise.resolve();
+  const serialize = createAsyncQueue();
   let revision = 0;
   const available = () => {
-    try { return safeStorage.isEncryptionAvailable() === true; } catch { return false; }
+    try {
+      return safeStorage.isEncryptionAvailable() === true
+        && !(process.platform === 'linux' && typeof safeStorage.getSelectedStorageBackend === 'function'
+          && safeStorage.getSelectedStorageBackend() === 'basic_text');
+    } catch { return false; }
   };
   const requireEncryption = () => {
     if (!available()) throw new Error('系统加密不可用，无法保存或读取账号密码。');
   };
-  async function read() {
+  async function readFile() {
     let data;
     try { data = await fs.readFile(filePath); } catch (error) {
       if (error.code === 'ENOENT') return null;
-      throw new Error('无法读取保存的账号密码。');
+      throw new Error('无法读取保存的账号密码。', { cause: error });
     }
+    return data;
+  }
+  function decrypt(data) {
     requireEncryption();
     try {
       if (data.length > 32 * 1024) throw new Error();
@@ -41,26 +47,15 @@ function createCredentialStore({ filePath, safeStorage }) {
       const record = JSON.parse(safeStorage.decryptString(Buffer.from(envelope.encrypted, 'base64')));
       if (!validCredential(record)) throw new Error();
       return record;
-    } catch {
-      throw new Error('保存的账号密码无法解密，请删除后重新保存。');
+    } catch (cause) {
+      throw new Error('保存的账号密码无法解密，请删除后重新保存。', { cause });
     }
-  }
-  function serialize(action) {
-    const next = pending.then(action, action);
-    pending = next.catch(() => {});
-    return next;
   }
   async function readStatus() {
-    let exists;
-    try { exists = (await fs.stat(filePath)).isFile(); } catch (error) {
-      if (error.code !== 'ENOENT') throw new Error('无法读取保存的账号密码。');
-      exists = false;
-    }
-    const result = { available: available(), saved: exists };
-    if (exists && result.available) {
-      try {
-        await read();
-      } catch { result.error = '保存的账号密码无法读取，请删除后重新保存。'; }
+    const data = await readFile();
+    const result = { available: available(), saved: data !== null };
+    if (result.saved && result.available) {
+      try { decrypt(data); } catch { result.error = '保存的账号密码无法读取，请删除后重新保存。'; }
     }
     return result;
   }
@@ -69,11 +64,15 @@ function createCredentialStore({ filePath, safeStorage }) {
     revision: () => revision,
     async get(origin) {
       if (!isCredentialOrigin(origin)) throw new Error('不允许在此网站使用保存的账号密码。');
-      await pending;
-      const record = await read();
-      return record && record.origin === origin ? record : null;
+      return serialize(async () => {
+        const data = await readFile();
+        return data === null ? null : { ...decrypt(data), origin };
+      });
     },
-    save(record) {
+    save(record, { expectedRevision } = {}) {
+      if (Number.isInteger(expectedRevision) && expectedRevision !== revision) {
+        return Promise.reject(new Error('保存已被删除或覆盖，请重新读取表单后再试。'));
+      }
       if (!validCredential(record)) return Promise.reject(new Error('请输入有效的账号和密码。'));
       revision++;
       return serialize(async () => {
@@ -87,15 +86,10 @@ function createCredentialStore({ filePath, safeStorage }) {
           throw new Error('无法加密账号密码。', { cause });
         }
         const data = JSON.stringify({ version: 1, encrypted });
-        const temporary = `${filePath}.${randomUUID()}.tmp`;
         try {
-          await fs.mkdir(path.dirname(filePath), { recursive: true });
-          await fs.writeFile(temporary, data, { mode: 0o600, flag: 'wx' });
-          await fs.rename(temporary, filePath);
+          await atomicWriteFile(filePath, data, { mode: 0o600 });
         } catch (cause) {
           throw new Error('无法将已加密的账号密码保存到本机。', { cause });
-        } finally {
-          await fs.unlink(temporary).catch(() => {});
         }
       });
     },
@@ -103,7 +97,7 @@ function createCredentialStore({ filePath, safeStorage }) {
       revision++;
       return serialize(async () => {
         try { await fs.unlink(filePath); } catch (error) {
-          if (error.code !== 'ENOENT') throw new Error('无法删除保存的账号密码。');
+          if (error.code !== 'ENOENT') throw new Error('无法删除保存的账号密码。', { cause: error });
         }
       });
     },

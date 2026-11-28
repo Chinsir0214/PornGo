@@ -170,3 +170,17 @@ test('queue callbacks expose retries waiting behind active videos', async () => 
   assert.deepEqual(starts, [['first', 1, 0], ['second', 1, 0], ['first', 2, 0]]);
   assert.deepEqual(retries, [['first', 2, 1]]);
 });
+
+test('permanent returned and thrown errors settle once and allow later videos to finish', async () => {
+  const attempts = [];
+  const result = await processDownloadQueue(['private', 'missing executable', 'ok'], {
+    download: async ({ item }) => {
+      attempts.push(item.attempt);
+      if (item.index === 0) return { message: 'private', retryable: false };
+      if (item.index === 1) throw Object.assign(new Error('missing executable'), { code: 'ENOENT' });
+    },
+    onRetry: () => assert.fail('unexpected retry'),
+  });
+  assert.deepEqual(attempts, [1, 1, 1]);
+  assert.deepEqual(result, { completedCount: 1, failedCount: 2, failures: ['private', 'missing executable'] });
+});

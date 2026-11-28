@@ -19,7 +19,7 @@ function control({ href = '', text = '', label = '', visible = true, rect, style
   };
 }
 
-function inspect(controls) {
+function inspect(controls, headerControls = controls) {
   controls.forEach((node, index) => {
     if (!node.rect) node.rect = {
       left: 10, top: 10 + index * 30, right: 110, bottom: 30 + index * 30,
@@ -29,7 +29,10 @@ function inspect(controls) {
   return vm.runInNewContext(`(${inspectSiteLoginState.toString()})()`, {
     window: { innerWidth: 400, innerHeight: 300 },
     document: {
-      querySelectorAll: () => controls,
+      querySelectorAll(query) {
+        assert.equal(typeof query, 'string');
+        return query.startsWith(':is(') ? headerControls : controls;
+      },
       elementFromPoint(x, y) {
         const found = controls.find((node) => x >= node.rect.left && x < node.rect.right
           && y >= node.rect.top && y < node.rect.bottom);
@@ -176,4 +179,9 @@ test('account probing never clicks forms, navigation links, or controls outside 
     assert.equal(menu.run(), 'unknown');
     assert.equal(menu.clicks(), 0);
   }
+});
+
+test('login controls outside the header are detected by the document scan', () => {
+  assert.equal(inspect([control({ text: 'Sign in' })], []), 'signed_out');
+  assert.equal(inspect([control({ text: 'View my profile' }), control({ text: 'Log out' })], []), 'verified');
 });

@@ -1,20 +1,25 @@
 'use strict';
 
-const { mkdir: makeDirectory } = require('node:fs/promises');
+const fsp = require('node:fs/promises');
+const { outputTemplate } = require('./download-artifact');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { MAX_DOWNLOAD_ATTEMPTS, validateDownloadConcurrency, processDownloadQueue: processQueue } = require('./download-queue');
 const { validateDownloadDirectory: validateDirectory } = require('./download-directory');
-const { formatExpression } = require('./pornhub');
+const { formatExpression } = require('./ytdlp-protocol');
 
-function safeFolderName(value) {
-  return String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
-    .replace(/[. ]+$/g, '').trim().slice(0, 80) || 'PornGo';
+const MAX_PENDING_DOWNLOADS = 20;
+const MAX_RETRY_BATCHES = 20;
+
+function safeFolderName(value, maxLength) {
+  const name = String(value).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim()
+    .slice(0, maxLength).replace(/[. ]+$/g, '') || 'PornGo';
+  return /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)/i.test(name) ? '_' + name : name;
 }
 
 function createDownloadTasks({
-  getSnapshot, emitDownload, createCookieFile, resolveVideoTitle, downloadOne,
-  validateDownloadDirectory = validateDirectory, mkdir = makeDirectory,
+  getSnapshot, emitDownload: notifyDownload, onBusyChange = () => {}, createCookieFile, resolveVideoTitle, downloadOne,
+  validateDownloadDirectory = validateDirectory, mkdir = fsp.mkdir, realpath = fsp.realpath,
   processDownloadQueue = processQueue, cancelRunning, createTaskId = randomUUID,
 }) {
   let activeDownload = null;
@@ -24,10 +29,21 @@ function createDownloadTasks({
   const retryableDownloads = new Map();
   let enqueueDownload = Promise.resolve();
 
+  let submissions = 0;
+  const isBusy = () => Boolean(activeDownload || pendingDownloads.length);
+
+  function emitDownload(event) {
+    try { notifyDownload(event); } catch { /* A closed window cannot receive events. */ }
+  }
+
+  function assertOpen() {
+    if (closing) throw new Error('应用正在退出。');
+  }
+
   function createTask({ videos, ...settings }) {
     return {
       ...settings, taskId: createTaskId(), videos: videos.map((video) => ({ ...video })),
-      cookieFile: null, cancelled: false, cancelOperations: Promise.resolve(),
+      cookieFile: null, abortController: new AbortController(), cancelled: false, cancelOperations: Promise.resolve(),
       completedCount: 0, failedCount: 0, percent: 0,
     };
   }
@@ -44,10 +60,25 @@ function createDownloadTasks({
         concurrency: task.videoConcurrency,
         isCancelled: () => task.cancelled,
         download: async ({ item, reportProgress }) => {
-          await resolveVideoTitle(item.video, task);
-          if (task.cancelled) return null;
+          const { signal } = task.abortController;
+          if (signal.aborted) return null;
+          try {
+            await resolveVideoTitle(item.video, { signal });
+          } catch (error) {
+            if (signal.aborted) return null;
+            throw error;
+          }
+          if (signal.aborted) return null;
           reportProgress();
-          return downloadOne(task, item, reportProgress);
+          if (task.videoConcurrency === 1) return downloadOne(task, item, reportProgress);
+          const file = path.join(path.dirname(task.cookieFile.file), randomUUID() + '.txt');
+          try {
+            await fsp.copyFile(task.cookieFile.file, file, fsp.constants.COPYFILE_EXCL);
+            if (signal.aborted) return null;
+            return await downloadOne({ ...task, cookieFile: { file } }, item, reportProgress);
+          } finally {
+            await fsp.rm(file, { force: true });
+          }
         },
         onProgress: ({ item: { video, index, attempt }, percent, itemPercent, details }) => {
           task.percent = percent;
@@ -112,7 +143,6 @@ function createDownloadTasks({
               fileName: task.videos[index].downloadFileName } });
         },
       });
-      await task.cancelOperations;
       const type = task.cancelled ? 'cancelled'
         : task.failedCount === 0 ? 'completed'
           : task.completedCount === 0 ? 'failed' : 'partial';
@@ -133,12 +163,21 @@ function createDownloadTasks({
         itemCount: task.videos.length, completedCount: task.completedCount,
         failedCount: task.failedCount };
     } finally {
-      await task.cancelOperations;
-      if (task.cookieFile) await task.cookieFile.cleanup().catch(() => {});
-      terminalEvent.failedBatch = finishFailedBatch(task, settledItems, failedItems);
-      if (activeDownload === task) activeDownload = null;
-      emitDownload(terminalEvent);
-      pumpDownloadQueue();
+      try {
+        await task.cancelOperations;
+      } finally {
+        try {
+          if (task.cookieFile) {
+            try { await task.cookieFile.cleanup(); } catch { /* Retry cleanup on exit. */ }
+          }
+          terminalEvent.failedBatch = finishFailedBatch(task, settledItems, failedItems);
+          emitDownload(terminalEvent);
+        } finally {
+          if (activeDownload === task) activeDownload = null;
+          pumpDownloadQueue();
+          onBusyChange();
+        }
+      }
     }
   }
 
@@ -170,10 +209,18 @@ function createDownloadTasks({
         fragmentConcurrency: task.fragmentConcurrency, videoConcurrency: task.videoConcurrency,
         items: new Map([...failedItems].map(([index, error]) => [index + 1,
           { itemIndex: index + 1, video: { ...task.videos[index] }, error, pending: false }])) };
-      retryableDownloads.set(batch.taskId, batch);
+
     }
     const snapshot = failedBatchSnapshot(batch);
-    if (batch && batch.items.size === 0) retryableDownloads.delete(batch.taskId);
+    if (batch) {
+      retryableDownloads.delete(batch.taskId);
+      if (batch.items.size) retryableDownloads.set(batch.taskId, batch);
+      const idle = [...retryableDownloads.values()].filter((entry) =>
+        ![...entry.items.values()].some((item) => item.pending));
+      for (const entry of idle.slice(0, Math.max(0, idle.length - MAX_RETRY_BATCHES))) {
+        retryableDownloads.delete(entry.taskId);
+      }
+    }
     return snapshot;
   }
 
@@ -194,6 +241,8 @@ function createDownloadTasks({
     emitDownload({ taskId: task.taskId, type: 'started',
       itemCount: task.videos.length, currentTitle: task.title, percent: 0 });
     activeFinished = runDownloadTask(task);
+    activeFinished.catch(() => {});
+    onBusyChange();
   }
 
   async function prepareDownload(request) {
@@ -214,14 +263,23 @@ function createDownloadTasks({
       videos = videos.filter((_video, index) => selected.has(index + 1));
     }
     let directory = await validateDownloadDirectory(request.directory);
+    assertOpen();
     const format = formatExpression(request.formatId);
     const { fragmentConcurrency, videoConcurrency } = validateDownloadConcurrency(
       parsed.kind, request.fragmentConcurrency, request.videoConcurrency);
     if (parsed.kind !== 'video') {
-      const folder = `${safeFolderName(parsed.title).slice(0, 60)} [${safeFolderName(parsed.id).slice(0, 32)}]`;
-      directory = path.join(directory, folder);
-      await mkdir(directory, { recursive: true });
+      const folder = `${safeFolderName(parsed.title, 60)} [${safeFolderName(parsed.id, 32)}]`;
+      const base = await realpath(directory);
+      const batchDir = path.join(base, folder);
+      for (const video of videos) outputTemplate(batchDir, video.url);
+      await mkdir(batchDir, { recursive: true });
+      directory = await realpath(batchDir);
+      if (path.relative(base, path.dirname(directory)) !== '') {
+        throw new Error('批次文件夹位于所选保存目录之外，请重新选择目录。');
+      }
+      assertOpen();
     }
+    for (const video of videos) outputTemplate(directory, video.url);
     return enqueueTask(createTask({
       kind: parsed.kind, title: parsed.title, videos,
       directory, format, formatId: request.formatId, fragmentConcurrency, videoConcurrency,
@@ -237,6 +295,11 @@ function createDownloadTasks({
       throw new Error('请选择尚未重新下载的失败项目。');
     }
     await validateDownloadDirectory(batch.directory);
+    if (batch.kind !== 'video' && path.relative(batch.directory, await realpath(batch.directory)) !== '') {
+      throw new Error('批次文件夹的位置已变化，请重新选择目录。');
+    }
+    assertOpen();
+    if (retryableDownloads.get(batch.taskId) !== batch) throw new Error('失败项目已失效。');
     const sortedIndices = [...indices].sort((a, b) => a - b);
     const task = createTask({
       kind: batch.kind, title: batch.title, videos: sortedIndices.map((index) => batch.items.get(index).video),
@@ -250,10 +313,15 @@ function createDownloadTasks({
   }
 
   function serializeSubmission(prepare, request) {
+    if (closing) return Promise.reject(new Error('应用正在退出。'));
+    if (pendingDownloads.length + submissions >= MAX_PENDING_DOWNLOADS) {
+      return Promise.reject(new Error('下载队列已满，请稍后再试。'));
+    }
+    submissions++;
     const result = enqueueDownload.then(() => {
-      if (closing) throw new Error('应用正在退出。');
+      assertOpen();
       return prepare(request);
-    });
+    }).finally(() => { submissions--; });
     enqueueDownload = result.catch(() => {});
     return result;
   }
@@ -263,8 +331,13 @@ function createDownloadTasks({
       const task = activeDownload;
       if (task.cancelled) return task.cancelOperations;
       task.cancelled = true;
-      task.titleAbortController?.abort();
-      task.cancelOperations = cancelRunning(task.taskId);
+      task.abortController.abort();
+      try {
+        task.cancelOperations = Promise.resolve(cancelRunning(task.taskId));
+      } catch (error) {
+        task.cancelOperations = Promise.reject(error);
+      }
+      task.cancelOperations.catch(() => {});
       return task.cancelOperations;
     }
     return removeQueuedDownload(taskId);
@@ -284,7 +357,7 @@ function createDownloadTasks({
   return {
     startDownload: (request) => serializeSubmission(prepareDownload, request),
     retryDownload: (request) => serializeSubmission(prepareRetry, request),
-    cancelDownload, removeQueuedDownload,
+    cancelDownload, removeQueuedDownload, isBusy,
     async close() {
       closing = true;
       if (activeDownload) cancelDownload(activeDownload.taskId);

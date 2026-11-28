@@ -2,29 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
+const { createRendererHarness } = require('./helpers/renderer-harness');
 const { normalizeResourceUrl } = require('../src/pornhub');
 
 test('renderer delegates URL validation and keeps batch concurrency when editing single-video settings', async () => {
-  const elements = new Map();
-  function element(key) {
-    if (!elements.has(key)) {
-      elements.set(key, {
-        value: '', textContent: '', hidden: false, disabled: false,
-        dataset: {}, style: {}, handlers: {}, attributes: {},
-        classList: { add() {}, remove() {}, toggle() {} },
-        addEventListener(name, callback) { this.handlers[name] = callback; },
-        setAttribute(name, value) { this.attributes[name] = value; },
-        removeAttribute(name) { delete this.attributes[name]; },
-        focus() { this.focused = true; },
-        replaceChildren() { this.value = ''; },
-        append(option) { if (!this.value) this.value = option.value; },
-      });
-    }
-    return elements.get(key);
-  }
   const url = 'http://de.pornhub.com/view_video.php?viewkey=example';
   let submitted;
   let emit;
@@ -32,7 +13,6 @@ test('renderer delegates URL validation and keeps batch concurrency when editing
   let saved = JSON.stringify({ fragmentConcurrency: '1', videoConcurrency: '2' });
   const parsedUrls = [];
   const api = {
-    getDirectory: async () => path.join(__dirname, '..', 'downtest'),
     sessionStatus: async () => ({ cookieCount: 0 }),
     parse: async (input) => {
       parsedUrls.push(input);
@@ -49,18 +29,15 @@ test('renderer delegates URL validation and keeps batch concurrency when editing
     },
     onDownloadEvent: (listener) => { emit = listener; }, onLoginClosed: () => {},
   };
-  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer.js'), 'utf8');
-  vm.runInNewContext(source, {
-    window: { porngo: api, localStorage: { getItem: () => saved, setItem: (_key, value) => { saved = value; } } },
-    document: { getElementById: element, querySelector: element, createElement: () => ({}) },
-    URL,
+  const { element, document } = createRendererHarness(api, {
+    localStorage: { getItem: () => saved, setItem: (_key, value) => { saved = value; } },
   });
   await new Promise(setImmediate);
-  const submit = () => element('parse-form').handlers.submit({ preventDefault() {} });
+  const submit = () => element('parse-form').dispatch('submit', { preventDefault() {} });
   await submit();
   assert.deepEqual(parsedUrls, []);
   assert.equal(element('video-url').attributes['aria-invalid'], 'true');
-  assert.equal(element('video-url').focused, true);
+  assert.equal(document.activeElement, element('video-url'));
 
   const invalidHost = 'https://pornhub.com.evil.example/view_video.php?viewkey=example';
   element('video-url').value = invalidHost;
@@ -88,16 +65,31 @@ test('renderer delegates URL validation and keeps batch concurrency when editing
   assert.equal(element('video-concurrency').value, '1');
   assert.equal(element('video-concurrency').disabled, true);
   element('fragment-concurrency').value = '4';
-  element('fragment-concurrency').handlers.change();
+  element('fragment-concurrency').dispatch('change');
   assert.deepEqual(JSON.parse(saved), { fragmentConcurrency: '4', videoConcurrency: '2' });
-  await element('download-button').handlers.click();
+  await element('download-button').dispatch('click');
   assert.equal(submitted.videoConcurrency, 1);
   assert.equal(submitted.fragmentConcurrency, 4);
   assert.equal(submitted.snapshotId, 'snapshot-4');
 
   element('video-url').value = 'https://www.pornhub.com/playlist/123';
-  element('video-url').handlers.input();
+  element('video-url').dispatch('input');
   await submit();
   assert.equal(element('video-concurrency').disabled, false);
   assert.equal(element('video-concurrency').value, '2');
+});
+
+test('startup uses the default concurrency options when IPC rejects', async () => {
+  const { element } = createRendererHarness({
+    concurrencyOptions: async () => { throw new Error('offline'); },
+  });
+  await new Promise(setImmediate);
+  for (const [id, options, selected] of [
+    ['fragment-concurrency', ['1', '4'], '1'], ['video-concurrency', ['1', '2'], '1'],
+  ]) {
+    const select = element(id);
+    assert.deepEqual(select.querySelectorAll('option').map((option) => option.value), options);
+    assert.equal(select.value, selected);
+  }
+  assert.match(element('notice-message').textContent, /已使用默认设置.*offline/);
 });

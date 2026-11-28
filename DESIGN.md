@@ -15,6 +15,26 @@ colors:
   white: "#ffffff"
   muted: "#d4d1e6"
   focus: "#fff06a"
+  control-text: "#2e2051"
+  disabled-text: "#2e3852"
+  disabled-surface: "#b7c2d6"
+  outline-border: "#ffffffaa"
+  divider-subtle: "#ffffff33"
+  divider: "#ffffff55"
+  account-divider: "#ffffff66"
+  queue-divider: "#ffffff45"
+  resource-text: "#e5d7fa"
+  account-text: "#ffe2ee"
+  progress-text: "#e2e9ff"
+  failed-surface: "#713852"
+  dialog-surface: "#324aa1"
+  notice-error-surface: "#b9364a"
+  notice-success-surface: "#087e6b"
+  session-neutral: "#938aaf"
+  danger-surface: "#aa2649"
+  destination-field-surface: "#006e6c"
+  thumbnail-surface: "#3f1c78"
+  history-row-surface: "#0002"
 typography:
   display:
     fontFamily: "Segoe UI, Microsoft YaHei UI, Microsoft YaHei, sans-serif"
@@ -23,7 +43,7 @@ typography:
 rounded:
   DEFAULT: "0px"
 spacing:
-  tile-gap: "12px"
+  tile-gap: "10px"
 components:
   tile:
     radius: "0px"
@@ -54,7 +74,7 @@ The Windows 8.1 Start screen: large type, edge-to-edge saturated tiles, and moti
 
 The deep violet canvas frames flat colored work tiles. Blue means entering a link, violet means parsed content, teal means destination, magenta means account, download blue means concurrency settings and progress, and orange is the download action. Amber is reserved for the live tile and active session indicator. White text and the yellow focus ring stay visible on saturated tiles. Error, success, and disabled states retain text labels rather than relying on color.
 
-The session indicator uses static amber when the visible account menu confirms a login, and labels that state as recently confirmed after the embedded window closes. Saved site data without a clear login signal stays neutral and does not claim the user is signed out.
+The round session dot stays static. Amber marks a verified or recently verified login. A neutral dot accompanies saved but unverified data, an explicit signed-out result, an empty session, or a status read error. The accompanying text distinguishes these states.
 
 ## Typography
 
@@ -62,7 +82,7 @@ Segoe UI supplies the light Windows-style display headings; Microsoft YaHei UI a
 
 ## Layout
 
-The desktop divides the work and account/progress columns in a 3:2 ratio with a 12px tile gap. The dark 54px application header is also the draggable window titlebar, with native-sized window actions at its right edge. The default window is 1060 × 780 and the minimum is 980 × 780. Tile padding and the live tile are compact so the workflow retains its sequence in the available height. Once content is parsed, the introductory panel gives way to the full content and quality controls.
+The desktop divides the work and account/progress columns in a 3:2 ratio with a 10px tile gap. The dark 54px application header is also the draggable window titlebar, with native-sized window actions at its right edge. The default window is 1060 × 780 and the minimum is 980 × 780. Tile padding and the live tile are compact so the workflow retains its sequence in the available height. Once content is parsed, the introductory panel gives way to the full content and quality controls.
 
 Live video rows place the title, speed, and time remaining on one line when their content fits. The timing metrics move below the title in narrow cards. Download history and failed items appear below the work and status columns, sharing the row when both have enough space. Long lists scroll within their tiles, and long titles, paths, and messages wrap. At narrower viewports the account and progress tiles move below the workflow and stack when the available width can no longer fit both.
 
@@ -84,7 +104,7 @@ Buttons show hover brightness, pressed scale, visible keyboard focus, disabled o
 
 ### Buttons and actions
 
-White buttons are local tile actions. The orange full-width button starts downloading. Session clearing uses a separate confirmation dialog with explicit action labels and initial focus on the safe action.
+White buttons are local tile actions. Disabled light controls use the disabled surface and text tokens. Disabled header actions use #cbc5e6 text on #332a63. Disabled account text buttons use #f4bed4 on magenta at full opacity. The orange full-width button starts downloading. Session clearing uses a separate confirmation dialog with explicit action labels and initial focus on the safe action.
 
 ### Navigation and data display
 
@@ -100,7 +120,7 @@ Simple text glyphs and geometric marks support labels; they do not replace actio
 
 ### Motion
 
-Startup shows the workspace as soon as its first frame is ready, with a brief slide that keeps the tiles visible throughout. The live tile cycles calmly between supported content types. Busy actions spin until their operation ends; progress and session states breathe only while active. All motion stops under `prefers-reduced-motion`.
+Startup shows the workspace as soon as its first frame is ready, with a brief slide that keeps the tiles visible throughout. The live tile cycles calmly between supported content types. Busy actions spin until their operation ends. The running download tile animates its section icon with `progress-breathe`. All motion stops under `prefers-reduced-motion`.
 
 ### Content and data visualization
 

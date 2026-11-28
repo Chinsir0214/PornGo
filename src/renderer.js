@@ -2,6 +2,13 @@
   'use strict';
 
   const api = window.porngo;
+  const { formatDuration, safeThumbnailUrl, formatQuality, batchCounts, errorMessage,
+    kindNames, downloadStates, terminalDownloadStates, createRevisionGuard,
+    setText, createIcon, bindConfirmation } = window.PornGoRenderer;
+  const disposers = [];
+  window.addEventListener('pagehide', () => {
+    for (const dispose of disposers.splice(0)) if (typeof dispose === 'function') dispose();
+  }, { once: true });
   const elements = {
     appHeader: document.querySelector('.app-header'),
     mainColumn: document.querySelector('.main-column'),
@@ -14,10 +21,13 @@
     loginButton: document.getElementById('login-button'),
     loginHelp: document.getElementById('login-help'),
     logoutButton: document.getElementById('logout-button'),
+    credentialsRefresh: document.getElementById('credentials-refresh'),
     credentialsSave: document.getElementById('credentials-save'),
     credentialsFill: document.getElementById('credentials-fill'),
     credentialsDelete: document.getElementById('credentials-delete'),
     deleteCredentialsDialog: document.getElementById('delete-credentials-dialog'),
+    deleteCredentialsConfirm: document.getElementById('delete-credentials-confirm'),
+    clearSessionConfirm: document.getElementById('clear-session-confirm'),
     deleteCredentialsCancel: document.getElementById('delete-credentials-cancel'),
     notice: document.getElementById('notice'),
     noticeMessage: document.getElementById('notice-message'),
@@ -60,6 +70,7 @@
     progressVideos: document.getElementById('progress-videos'),
     progressDetail: document.getElementById('progress-detail'),
     queueStatus: document.getElementById('queue-status'),
+    queueAnnouncement: document.getElementById('queue-announcement'),
     queueToggle: document.getElementById('queue-toggle'),
     queueList: document.getElementById('queue-list'),
     downloadTaskHistory: document.getElementById('download-task-history'),
@@ -87,6 +98,7 @@
   const queueRows = new Map();
   const cancellingQueuedTasks = new Set();
   let queueExpanded = false;
+  const MAX_FAILED_BATCHES = 20;
   const failedBatches = new Map();
   const failedBatchRevisions = new Map();
   let submittingDownload = false;
@@ -94,7 +106,7 @@
   let cancelling = false;
   let loginBusy = false;
   let loginWindowOpen = false;
-  let loginWindowRevision = -1;
+  const acceptLoginWindowRevision = createRevisionGuard();
   let credentialsReady = false;
   let credentialsAvailable = false;
   let credentialsSaved = false;
@@ -109,19 +121,12 @@
   const changedProgressItems = new Set();
   let activeVideoRows = new Map();
   let sessionRevision = 0;
-  let latestAuthRevision = -1;
-  const kindNames = { video: '单视频', playlist: '片单', pornstar: '色情明星视频' };
-  const downloadStates = {
-    queued: '排队等待', downloading: '正在下载', retry: '等待重试', cancelling: '正在取消',
-    completed: '下载完成', partial: '部分完成', failed: '下载失败', cancelled: '已取消',
-  };
-  const terminalDownloadStates = ['completed', 'partial', 'failed', 'cancelled'];
+  const acceptAuthRevision = createRevisionGuard();
+  let authState = '';
+  let parseAuthState = '';
+  const finishedTaskIds = [];
   const concurrencySettingsKey = 'porngo.downloadConcurrency';
   const urlHelpText = '支持 Pornhub 视频、片单和明星视频页（HTTP/HTTPS）';
-
-  function setText(element, text) {
-    if (element.textContent !== text) element.textContent = text;
-  }
 
   function configureConcurrency(options) {
     const selectors = [
@@ -135,21 +140,24 @@
       // Keep the default selections when storage is unavailable or invalid.
     }
     for (const [select, values, unit] of selectors) {
+      const optionsFragment = document.createDocumentFragment();
       for (const value of values) {
         const option = document.createElement('option');
         option.value = String(value);
         option.textContent = `${value === 1 ? '顺序' : '并发'} · ${value} ${unit}`;
-        select.append(option);
+        optionsFragment.append(option);
       }
+      select.replaceChildren(optionsFragment);
     }
     concurrencyOptions = options;
     const fragment = options.fragment.map(String);
     const video = options.video.map(String);
     elements.fragmentConcurrency.value = fragment.includes(saved?.fragmentConcurrency)
-      ? saved.fragmentConcurrency : fragment[0];
-    batchVideoConcurrency = video.includes(saved?.videoConcurrency) ? saved.videoConcurrency : video[0];
+      ? saved.fragmentConcurrency : String(options.defaults?.fragment ?? fragment[0]);
+    batchVideoConcurrency = video.includes(saved?.videoConcurrency)
+      ? saved.videoConcurrency : String(options.defaults?.video ?? video[0]);
     setVideoConcurrency();
-    updateControls();
+    updateDownloadControls();
   }
 
   function setVideoConcurrency() {
@@ -184,8 +192,11 @@
       queueRows.delete(taskId);
     }
     if (count === 0) queueExpanded = false;
+    const toggleFocused = document.activeElement === elements.queueToggle;
     elements.queueToggle.hidden = count === 0;
-    if (elements.queueStatus.textContent !== status) elements.queueStatus.textContent = status;
+    if (count === 0 && toggleFocused) elements.progressStatus.focus({ preventScroll: true });
+    setText(elements.queueStatus, status);
+    setText(elements.queueAnnouncement, status);
     elements.queueToggle.setAttribute('aria-expanded', String(queueExpanded));
     elements.queueList.hidden = count === 0 || !queueExpanded;
     queuedTasks.forEach((task, index) => {
@@ -193,6 +204,8 @@
       if (!controls) {
         const row = document.createElement('div');
         row.className = 'download-list-row queue-row';
+        row.dataset.testid = 'queue-item';
+        row.setAttribute('role', 'listitem');
         const title = document.createElement('span');
         title.className = 'queue-row-title';
         const remove = document.createElement('button');
@@ -236,12 +249,7 @@
     title.className = 'download-task-title';
     const status = document.createElement('span');
     status.className = 'download-task-status';
-    const disclosure = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    disclosure.setAttribute('class', 'ui-icon ui-icon--chevron-down download-task-summary-icon');
-    disclosure.setAttribute('aria-hidden', 'true');
-    const disclosureUse = document.createElementNS('http://www.w3.org/2000/svg', 'use');
-    disclosureUse.setAttribute('href', '#icon-chevron-down');
-    disclosure.append(disclosureUse);
+    const disclosure = createIcon('chevron-down', 'download-task-summary-icon');
     summary.append(title, status, disclosure);
     const error = document.createElement('p');
     error.className = 'download-task-error';
@@ -305,8 +313,9 @@
       && (!terminalDownloadStates.includes(task.state) || task.state === 'completed');
     const videoTitle = task.resource.kind === 'video' ? task.items.get(1)?.title : '';
     setText(view.title, videoTitle || task.resource.title || '未命名下载任务');
-    view.status.dataset.state = task.state;
-    setText(view.status, [task.retry ? '重新下载' : '', downloadStates[task.state],
+    const state = task.taskId === activeTaskId && cancelling && !terminalDownloadStates.includes(task.state) ? 'cancelling' : task.state;
+    view.status.dataset.state = state;
+    setText(view.status, [task.retry ? '重新下载' : '', downloadStates[state],
       count > 0 ? `${count} 条` : '', showPercent ? `${Math.round(task.percent)}%` : '',
       task.counts].filter(Boolean).join(' · '));
     setText(view.error, task.error || '');
@@ -323,6 +332,14 @@
     elements.downloadTaskList.append(row);
     elements.downloadTaskHistory.hidden = false;
     if (hadFocus) task.view.summary.focus();
+  }
+
+  function recordFinishedTask(taskId) {
+    finishedTaskIds.push(taskId);
+    if (finishedTaskIds.length <= 50) return;
+    const oldest = finishedTaskIds.shift();
+    downloadTasks.get(oldest)?.view?.details.parentElement?.remove();
+    downloadTasks.delete(oldest);
   }
 
   function updateTaskDetails(task, event, deferProgress = false) {
@@ -350,7 +367,8 @@
         if (item.state === 'completed') item.percent = 100;
         if (task.view?.rows.has(item.itemIndex)) renderTaskItem(task.view, item);
       }
-    } else if (task.state !== 'cancelling' && ['progress', 'retry'].includes(event.type)) {
+    } else if (['progress', 'retry'].includes(event.type)) {
+      task.latestActivity = event;
       const active = Array.isArray(event.activeVideos) ? event.activeVideos.length : event.activeCount;
       task.state = (active === 0 && event.retryCount > 0) || (event.type === 'retry' && !active)
         ? 'retry' : 'downloading';
@@ -362,7 +380,7 @@
     if (!api || cancellingQueuedTasks.has(taskId)
         || !queuedTasks.some((task) => task.taskId === taskId)) return;
     cancellingQueuedTasks.add(taskId);
-    updateControls();
+    renderQueue();
     try {
       const removed = await api.removeQueued(taskId);
       if (!removed && activeTaskId === taskId) showNotice('该任务已开始下载，无法从等待队列移除。');
@@ -370,7 +388,7 @@
       showNotice(`移除排队任务失败：${errorMessage(error)}`, 'error');
     } finally {
       cancellingQueuedTasks.delete(taskId);
-      updateControls();
+      renderQueue();
     }
   }
 
@@ -383,22 +401,14 @@
 
   if (api && typeof api.windowState === 'function') {
     api.windowState().then(setWindowState).catch(() => {});
-    api.onWindowState(setWindowState);
-    elements.windowMinimize.addEventListener('click', () => api.minimizeWindow());
-    elements.windowMaximize.addEventListener('click', () => api.toggleMaximizeWindow().then(setWindowState));
-    elements.windowClose.addEventListener('click', () => api.closeWindow());
+    disposers.push(api.onWindowState(setWindowState));
+    elements.windowMinimize.addEventListener('click', () => api.minimizeWindow().catch(() => {}));
+    elements.windowMaximize.addEventListener('click', () => api.toggleMaximizeWindow().then(setWindowState).catch(() => {}));
+    elements.windowClose.addEventListener('click', () => api.closeWindow().catch(() => {}));
     elements.appHeader.addEventListener('dblclick', (event) => {
       if (event.target.closest('button, .header-actions, .window-controls')) return;
-      api.toggleMaximizeWindow().then(setWindowState);
+      api.toggleMaximizeWindow().then(setWindowState).catch(() => {});
     });
-  }
-
-  function errorMessage(error) {
-    if (error && typeof error.message === 'string' && error.message.trim()) {
-      return error.message.replace(/^Error invoking remote method '[^']+': Error:\s*/, '');
-    }
-    if (typeof error === 'string' && error.trim()) return error;
-    return '操作失败，请稍后重试。';
   }
 
   function showNotice(message, kind = 'info') {
@@ -407,18 +417,19 @@
     elements.notice.setAttribute('role', kind === 'error' ? 'alert' : 'status');
     elements.notice.setAttribute('aria-live', kind === 'error' ? 'assertive' : 'polite');
     elements.noticeClose.disabled = false;
-    elements.notice.hidden = false;
+    elements.noticeClose.hidden = false;
+    elements.notice.classList.remove('sr-only');
   }
 
   function hideNotice() {
-    elements.notice.hidden = true;
+    elements.notice.classList.add('sr-only');
+    elements.noticeClose.hidden = true;
     elements.noticeMessage.textContent = '';
     elements.noticeClose.disabled = true;
   }
 
-  function updateControls() {
+  function updateParseControls() {
     const hasUrl = Boolean(elements.urlInput.value.trim());
-    const downloadWork = hasDownloadWork();
     elements.urlInput.disabled = false;
     elements.urlClear.hidden = !hasUrl;
     elements.urlClear.disabled = !hasUrl;
@@ -426,6 +437,10 @@
     elements.parseButton.textContent = parsing ? '解析中…' : '解析链接';
     elements.parseButton.classList.toggle('is-busy', parsing);
     elements.parseButton.setAttribute('aria-busy', String(parsing));
+  }
+
+  function updateDownloadControls() {
+    const downloadWork = hasDownloadWork();
     elements.directoryButton.disabled = directoryLoading || selectingDirectory;
     elements.formatSelect.disabled = false;
     elements.fragmentConcurrency.disabled = !concurrencyOptions;
@@ -437,8 +452,15 @@
       : downloadWork ? '加入下载队列' : '开始下载';
     elements.downloadButton.classList.toggle('is-busy', submittingDownload);
     elements.downloadButton.setAttribute('aria-busy', String(submittingDownload));
+    elements.cancelButton.hidden = !activeTaskId && !cancelling;
     elements.cancelButton.disabled = !activeTaskId || cancelling;
     elements.cancelButton.textContent = cancelling ? '正在取消…' : '取消下载';
+    elements.progressCard.dataset.state = downloadWork ? 'running'
+      : elements.progressContent.hidden ? 'idle' : 'finished';
+  }
+
+  function updateAuthControls() {
+    const downloadWork = hasDownloadWork();
     elements.loginButton.disabled = loginBusy || downloadWork;
     elements.loginButton.textContent = loginBusy ? '正在打开…'
       : loginWindowOpen ? '显示登录窗口' : '内嵌网页登录';
@@ -453,8 +475,14 @@
     elements.credentialsFill.disabled = credentialsLocked || !credentialsAvailable || credentialsUnreadable || !credentialsSaved || !loginWindowOpen;
     elements.credentialsDelete.hidden = !credentialsSaved;
     elements.credentialsDelete.disabled = credentialsLocked || !credentialsSaved;
-    elements.progressCard.dataset.state = downloadWork ? 'running'
-      : elements.progressContent.hidden ? 'idle' : 'finished';
+    elements.deleteCredentialsConfirm.disabled = elements.credentialsDelete.hidden || elements.credentialsDelete.disabled;
+    elements.clearSessionConfirm.disabled = elements.logoutButton.hidden || elements.logoutButton.disabled;
+  }
+
+  function updateControls() {
+    updateParseControls();
+    updateDownloadControls();
+    updateAuthControls();
     renderQueue();
     updateFailedControls();
   }
@@ -469,89 +497,130 @@
       batch.controls.all.indeterminate = selected > 0 && selected < available.length;
       batch.controls.retry.disabled = submittingDownload || selected === 0;
       batch.controls.retry.textContent = selected > 0 ? `重新下载选中项（${selected}）` : '重新下载选中项';
-      for (const { checkbox, item } of batch.controls.rows) checkbox.disabled = submittingDownload || item.pending;
+      for (const item of batch.items) {
+        batch.controls.rows.get(item.itemIndex).checkbox.disabled = submittingDownload || item.pending;
+      }
     }
   }
 
   function applyFailedBatch(snapshot) {
     if (!snapshot || typeof snapshot.taskId !== 'string' || !Array.isArray(snapshot.items)) return;
     if (Number.isInteger(snapshot.revision)) {
-      if (snapshot.revision <= (failedBatchRevisions.get(snapshot.taskId) || 0)) return;
+      if (snapshot.revision <= (failedBatchRevisions.get(snapshot.taskId) ?? -1)) return;
       failedBatchRevisions.set(snapshot.taskId, snapshot.revision);
     }
-    if (snapshot.items.length === 0) failedBatches.delete(snapshot.taskId);
-    else {
-      const previous = failedBatches.get(snapshot.taskId);
-      const selected = previous ? previous.selected : new Set();
-      for (const index of selected) {
-        if (!snapshot.items.some((item) => item.itemIndex === index && !item.pending)) selected.delete(index);
+    let batch = failedBatches.get(snapshot.taskId);
+    if (!snapshot.items.length) {
+      const restoreFocus = batch?.controls.group.contains(document.activeElement);
+      batch?.controls.group.remove();
+      failedBatches.delete(snapshot.taskId);
+      failedBatchRevisions.delete(snapshot.taskId);
+      if (restoreFocus) {
+        const next = failedBatches.values().next().value;
+        const target = next && !next.controls.all.disabled ? next.controls.all : elements.progressStatus;
+        target.focus({ preventScroll: true });
       }
-      failedBatches.set(snapshot.taskId, { ...snapshot, selected });
+    } else {
+      if (!batch) {
+        if (failedBatches.size >= MAX_FAILED_BATCHES) {
+          const oldest = failedBatches.keys().next().value;
+          const group = failedBatches.get(oldest).controls.group;
+          if (group.contains(document.activeElement)) elements.progressStatus.focus({ preventScroll: true });
+          group.remove();
+          failedBatches.delete(oldest);
+          failedBatchRevisions.delete(oldest);
+        }
+        batch = { selected: new Set() };
+        failedBatches.set(snapshot.taskId, batch);
+      }
+      Object.assign(batch, snapshot);
+      const available = new Set(batch.items.filter((item) => !item.pending).map((item) => item.itemIndex));
+      for (const index of batch.selected) if (!available.has(index)) batch.selected.delete(index);
     }
-    renderFailedBatches();
+    renderFailedBatches(snapshot.items.length ? batch : null);
   }
 
-  function renderFailedBatches() {
-    if (!elements.failedBatches || !elements.failedDownloads) return;
-    const groups = [...failedBatches.values()].map((batch) => {
-      const group = document.createElement('section');
-      group.className = 'failed-batch';
-      const heading = document.createElement('h3');
-      heading.textContent = `${batch.title || '未命名下载任务'} · ${batch.items.length} 项未成功`;
-      const context = document.createElement('p');
-      context.className = 'failed-batch-context';
-      const quality = batch.formatId === 'best' ? '最佳可用画质'
-        : typeof batch.formatId === 'string' && batch.formatId.startsWith('h:') ? `${batch.formatId.slice(2)}p 及以下` : batch.formatId || '';
-      context.textContent = [quality, batch.directory].filter(Boolean).join(' · ');
-      const allLabel = document.createElement('label');
-      allLabel.className = 'failed-select-all';
-      const all = document.createElement('input');
-      all.type = 'checkbox';
-      const allText = document.createElement('span');
-      allText.textContent = '全选可重试项';
-      all.addEventListener('change', () => {
-        batch.selected.clear();
-        if (all.checked) batch.items.filter((item) => !item.pending).forEach((item) => batch.selected.add(item.itemIndex));
-        for (const { checkbox, item } of batch.controls.rows) checkbox.checked = batch.selected.has(item.itemIndex);
-        updateFailedControls();
-      });
-      allLabel.append(all, allText);
-      const list = document.createElement('div');
-      list.className = 'failed-items';
-      list.setAttribute('role', 'list');
-      const rows = batch.items.map((item) => {
-        const row = document.createElement('label');
-        row.className = 'failed-item';
-        row.setAttribute('role', 'listitem');
-        const checkbox = document.createElement('input');
-        checkbox.type = 'checkbox';
-        checkbox.checked = batch.selected.has(item.itemIndex);
-        checkbox.addEventListener('change', () => {
-          if (checkbox.checked) batch.selected.add(item.itemIndex);
-          else batch.selected.delete(item.itemIndex);
-          updateFailedControls();
-        });
-        const copy = document.createElement('span');
-        const title = document.createElement('strong');
-        title.textContent = `第 ${item.itemIndex} 条 · ${item.title || '未命名视频'}`;
-        const error = document.createElement('span');
-        error.className = 'failed-item-error';
-        error.textContent = item.pending ? '已加入重新下载队列…' : item.error || '下载失败';
-        copy.append(title, error);
-        row.append(checkbox, copy);
-        list.append(row);
-        return { checkbox, item };
-      });
-      const retry = document.createElement('button');
-      retry.type = 'button';
-      retry.className = 'button button-outline button-block';
-      retry.addEventListener('click', () => retryFailedBatch(batch));
-      batch.controls = { all, retry, rows };
-      group.append(heading, context, allLabel, list, retry);
-      return group;
+  function createFailedBatchControls(batch) {
+    const group = document.createElement('section');
+    group.className = 'failed-batch';
+    const heading = document.createElement('h3');
+    const context = document.createElement('p');
+    context.className = 'failed-batch-context';
+    const allLabel = document.createElement('label');
+    allLabel.className = 'failed-select-all';
+    const all = document.createElement('input');
+    all.type = 'checkbox';
+    const allText = document.createElement('span');
+    allText.textContent = '全选可重试项';
+    all.addEventListener('change', () => {
+      batch.selected.clear();
+      if (all.checked) batch.items.filter((item) => !item.pending).forEach((item) => batch.selected.add(item.itemIndex));
+      renderFailedBatches(batch);
     });
-    elements.failedBatches.replaceChildren(...groups);
-    elements.failedDownloads.hidden = groups.length === 0;
+    allLabel.append(all, allText);
+    const list = document.createElement('ul');
+    list.className = 'failed-items';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'button button-outline button-block';
+    retry.addEventListener('click', () => retryFailedBatch(batch));
+    group.dataset.testid = 'failed-batch';
+    group.append(heading, context, allLabel, list, retry);
+    elements.failedBatches.append(group);
+    return { group, heading, context, all, list, retry, rows: new Map() };
+  }
+
+  function createFailedItem(batch, index) {
+    const row = document.createElement('li');
+    row.dataset.testid = 'failed-item';
+    const label = document.createElement('label');
+    label.className = 'failed-item';
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.addEventListener('change', () => {
+      if (checkbox.checked) batch.selected.add(index);
+      else batch.selected.delete(index);
+      updateFailedControls();
+    });
+    const copy = document.createElement('span');
+    const title = document.createElement('strong');
+    const error = document.createElement('span');
+    error.className = 'failed-item-error';
+    copy.append(title, error);
+    label.append(checkbox, copy);
+    row.append(label);
+    return { row, checkbox, title, error };
+  }
+
+  function renderFailedBatches(batch) {
+    if (batch) {
+      const view = batch.controls ||= createFailedBatchControls(batch);
+      setText(view.heading, `${batch.title || '未命名下载任务'} · ${batch.items.length} 项未成功`);
+      setText(view.context, [formatQuality(batch.formatId), batch.directory].filter(Boolean).join(' · '));
+      const indices = new Set(batch.items.map((item) => item.itemIndex));
+      const focused = document.activeElement;
+      const scrollTop = view.list.scrollTop;
+      for (const [index, controls] of view.rows) {
+        if (indices.has(index)) continue;
+        controls.row.remove();
+        view.rows.delete(index);
+      }
+      batch.items.forEach((item, position) => {
+        let controls = view.rows.get(item.itemIndex);
+        if (!controls) {
+          controls = createFailedItem(batch, item.itemIndex);
+          view.rows.set(item.itemIndex, controls);
+        }
+        const sibling = view.list.children[position];
+        if (sibling !== controls.row) view.list.insertBefore(controls.row, sibling || null);
+        controls.checkbox.checked = batch.selected.has(item.itemIndex);
+        setText(controls.title, `第 ${item.itemIndex} 条 · ${item.title || '未命名视频'}`);
+        setText(controls.error, item.pending ? '已加入重新下载队列…' : item.error || '下载失败');
+      });
+      if (view.list.contains(focused) && document.activeElement !== focused) focused.focus({ preventScroll: true });
+      view.list.scrollTop = scrollTop;
+    }
+    elements.failedDownloads.hidden = failedBatches.size === 0;
     updateFailedControls();
   }
 
@@ -564,17 +633,18 @@
   }
 
   function setSession(result) {
+    authState = (result?.loginState || '') + '/' + Boolean(Number(result?.cookieCount) > 0);
     if (result && result.loginState === 'error') {
       elements.sessionPill.dataset.state = 'unverified';
       elements.sessionLabel.textContent = '暂无法读取会话';
       elements.sessionSummary.textContent = '状态暂不可用';
       elements.sessionSummary.dataset.state = 'unverified';
       elements.loginHelp.textContent = '暂无法检查网站登录状态。解析和下载仍会尝试使用已保存的会话。';
-      updateControls();
+      elements.logoutButton.hidden = true;
+      updateAuthControls();
       return;
     }
-    const saved = Number.isFinite(Number(result && result.cookieCount))
-      && Number(result.cookieCount) > 0;
+    const saved = Number(result?.cookieCount) > 0;
     const verified = saved && result.loginState === 'verified';
     const recent = saved && result.loginState === 'recently_verified';
     const signedOut = saved && result.loginState === 'signed_out';
@@ -593,40 +663,13 @@
           : saved ? '在网页登录窗口完成登录后，应用会自动确认并关闭该窗口。解析和下载会使用已保存的会话。'
             : '在内嵌窗口登录 Pornhub。解析和下载会自动使用该窗口保存的网站会话。';
     elements.logoutButton.hidden = !saved;
-    updateControls();
+    updateAuthControls();
   }
 
   function applySessionStatus(result) {
-    const revision = result && result.revision;
-    if (Number.isInteger(revision) && revision >= 0) {
-      if (revision < latestAuthRevision) return false;
-      latestAuthRevision = revision;
-    }
+    if (!acceptAuthRevision(result?.revision)) return false;
     setSession(result);
     return true;
-  }
-
-  function formatDuration(seconds) {
-    const value = Number(seconds);
-    if (!Number.isFinite(value) || value <= 0) return '';
-    const minutes = Math.floor(value / 60);
-    const remaining = Math.floor(value % 60);
-    const hours = Math.floor(minutes / 60);
-    if (hours) return `${hours}:${String(minutes % 60).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`;
-    return `${minutes}:${String(remaining).padStart(2, '0')}`;
-  }
-
-  function safeThumbnailUrl(value) {
-    if (typeof value !== 'string') return '';
-    try {
-      const url = new URL(value);
-      const host = url.hostname.toLowerCase();
-      if (url.protocol !== 'https:') return '';
-      if (host !== 'pornhub.com' && !host.endsWith('.pornhub.com') && host !== 'phncdn.com' && !host.endsWith('.phncdn.com')) return '';
-      return url.href;
-    } catch {
-      return '';
-    }
   }
 
   function updatePerformerSelection() {
@@ -636,11 +679,12 @@
     elements.performerAll.checked = total > 0 && count === total;
     elements.performerAll.indeterminate = count > 0 && count < total;
     elements.performerCount.textContent = `已选 ${count} / ${total} 条`;
-    updateControls();
+    updateDownloadControls();
   }
 
   function showPerformerEntries(entries) {
     elements.performerHeading.append(elements.videoDetails);
+    const rows = document.createDocumentFragment();
     performerChecks = entries.map((entry) => {
       const row = document.createElement('label');
       row.className = 'performer-entry';
@@ -655,9 +699,10 @@
       url.textContent = entry.url;
       copy.append(title, url);
       row.append(checkbox, copy);
-      elements.performerEntries.append(row);
+      rows.append(row);
       return checkbox;
     });
+    elements.performerEntries.replaceChildren(rows);
     elements.performerDetails.open = true;
     elements.performerDetails.hidden = false;
     elements.performerCount.hidden = false;
@@ -681,6 +726,7 @@
     elements.formatRow.hidden = true;
     elements.concurrencyCard.hidden = true;
     elements.parsedTitle.textContent = '';
+    elements.parsedTitle.title = '';
     elements.videoMeta.textContent = '';
     elements.resourceKind.textContent = '已解析的内容';
     elements.thumbnailPlaceholder.classList.remove('is-batch');
@@ -688,7 +734,8 @@
     elements.thumbnail.hidden = true;
     elements.thumbnailPlaceholder.hidden = false;
     elements.formatSelect.replaceChildren();
-    updateControls();
+    updateParseControls();
+    updateDownloadControls();
   }
 
   function showResource(resource) {
@@ -699,7 +746,9 @@
     setVideoConcurrency();
     elements.resourceKind.textContent = `已解析的${kind}`;
     elements.thumbnailPlaceholder.classList.toggle('is-batch', isBatch);
-    elements.parsedTitle.textContent = typeof resource.title === 'string' && resource.title.trim() ? resource.title : `未命名${kind}`;
+    const title = typeof resource.title === 'string' && resource.title.trim() ? resource.title : `未命名${kind}`;
+    elements.parsedTitle.textContent = title;
+    elements.parsedTitle.title = title;
     const count = Number(resource.entryCount);
     const details = [kind, resource.kind === 'playlist' && Number.isInteger(count) ? `${count} 条视频` : '',
       resource.id ? `ID ${String(resource.id)}` : '', !isBatch ? formatDuration(resource.duration) : ''].filter(Boolean);
@@ -712,6 +761,7 @@
     else elements.thumbnail.removeAttribute('src');
 
     const choices = Array.isArray(resource.formats) ? resource.formats : [];
+    const options = document.createDocumentFragment();
     for (const format of choices) {
       if (!format || format.id == null) continue;
       const option = document.createElement('option');
@@ -719,14 +769,15 @@
       option.textContent = typeof format.label === 'string' && format.label.trim()
         ? format.label
         : [format.height ? `${format.height}p` : '', format.ext || ''].filter(Boolean).join(' · ') || String(format.id);
-      elements.formatSelect.append(option);
+      options.append(option);
     }
+    elements.formatSelect.replaceChildren(options);
     elements.videoEmpty.hidden = true;
     if (resource.kind === 'pornstar') showPerformerEntries(resource.entries);
     elements.videoDetails.hidden = false;
     elements.formatRow.hidden = false;
     elements.concurrencyCard.hidden = false;
-    updateControls();
+    updateDownloadControls();
   }
 
   function setProgress(percent, status, detail) {
@@ -778,13 +829,6 @@
     elements.progressItem.hidden = false;
   }
 
-  function batchCounts(event) {
-    const completed = Number(event && event.completedCount);
-    const failed = Number(event && event.failedCount);
-    if (!Number.isInteger(completed) || completed < 0 || !Number.isInteger(failed) || failed < 0) return '';
-    return `成功 ${completed} 条，失败 ${failed} 条`;
-  }
-
   function finishProgressItem(event, counts) {
     const resource = activeDownloadResource;
     if (!resource || resource.kind === 'video') return;
@@ -796,17 +840,16 @@
 
   function applyLoginWindowState(state) {
     if (!state || typeof state.windowOpen !== 'boolean' || !Number.isInteger(state.revision)
-        || state.revision < loginWindowRevision) return false;
-    loginWindowRevision = state.revision;
+        || !acceptLoginWindowRevision(state.revision)) return false;
     loginWindowOpen = state.windowOpen;
-    updateControls();
+    updateAuthControls();
     return true;
   }
 
   async function openLogin() {
     if (!api || loginBusy) return;
     loginBusy = true;
-    updateControls();
+    updateAuthControls();
     try {
       const result = await api.openLogin();
       if (applyLoginWindowState(result) && loginWindowOpen) {
@@ -816,14 +859,14 @@
       showNotice(`打开登录窗口失败：${errorMessage(error)}`, 'error');
     } finally {
       loginBusy = false;
-      updateControls();
+      updateAuthControls();
     }
   }
 
   function onLoginClosed(result) {
     if (!applySessionStatus(result)) return;
     sessionRevision++;
-    if (!hasDownloadWork()) {
+    if (!hasDownloadWork() && parseAuthState !== authState && (parsedResource || parsing)) {
       parseGeneration++;
       parsing = false;
       clearResource();
@@ -839,13 +882,13 @@
     } else {
       showNotice('内嵌网页登录窗口已关闭，尚无网站数据。');
     }
-    updateControls();
+    updateAuthControls();
   }
 
   async function logout() {
     if (!api || loginBusy) return;
     loginBusy = true;
-    updateControls();
+    updateAuthControls();
     try {
       const result = await api.logout();
       sessionRevision++;
@@ -858,35 +901,42 @@
       showNotice(`清除会话失败：${errorMessage(error)}`, 'error');
     } finally {
       loginBusy = false;
-      updateControls();
+      updateAuthControls();
     }
   }
 
   function setCredentialsStatus(result) {
+    elements.credentialsRefresh.hidden = true;
     credentialsReady = true;
     credentialsAvailable = Boolean(result && result.available);
     credentialsSaved = Boolean(result && result.saved);
     credentialsUnreadable = Boolean(result && result.error);
-    updateControls();
+    updateAuthControls();
+  }
+
+  async function refreshCredentials() {
+    const revision = ++credentialsRevision;
+    elements.credentialsRefresh.disabled = true;
+    try {
+      const result = await api.credentialsStatus();
+      if (revision === credentialsRevision) setCredentialsStatus(result);
+    } catch (error) {
+      if (revision !== credentialsRevision) return;
+      elements.credentialsRefresh.hidden = false;
+      showNotice(`读取保存的账号密码失败：${errorMessage(error)}`, 'error');
+    } finally {
+      if (revision === credentialsRevision) elements.credentialsRefresh.disabled = false;
+    }
   }
 
   function loadInitialAccountState() {
-    if (typeof api.credentialsStatus === 'function') {
-      const initialCredentialsRevision = credentialsRevision;
-      api.credentialsStatus().then((result) => {
-        if (credentialsRevision === initialCredentialsRevision) setCredentialsStatus(result);
-      }).catch((error) => {
-        if (credentialsRevision !== initialCredentialsRevision) return;
-        showNotice(`读取保存的账号密码失败：${errorMessage(error)}`, 'error');
-      });
-    }
+    if (typeof api.credentialsStatus === 'function') refreshCredentials();
     const initialSessionRevision = sessionRevision;
     api.sessionStatus().then((result) => {
       if (sessionRevision === initialSessionRevision) applySessionStatus(result);
     }).catch((error) => {
       if (sessionRevision !== initialSessionRevision) return;
-      elements.sessionLabel.textContent = '无法读取会话';
-      elements.sessionSummary.textContent = '无法读取';
+      setSession({ loginState: 'error' });
       showNotice(`读取会话失败：${errorMessage(error)}`, 'error');
     });
   }
@@ -900,7 +950,7 @@
       : action === 'fill' ? 'fillCredentials' : 'deleteCredentials';
     if (typeof api[method] !== 'function') return;
     credentialsBusy = true;
-    updateControls();
+    updateAuthControls();
     try {
       const result = await api[method]();
       if (action === 'fill' && (!result || result.filled !== true)) {
@@ -914,7 +964,7 @@
       showNotice(`${label}失败：${errorMessage(error)}`, 'error');
     } finally {
       credentialsBusy = false;
-      updateControls();
+      updateAuthControls();
     }
   }
 
@@ -932,10 +982,12 @@
     elements.urlInput.removeAttribute('aria-invalid');
     elements.urlHelp.textContent = urlHelpText;
     const generation = ++parseGeneration;
+    parseAuthState = authState;
     clearResource();
     hideNotice();
     parsing = true;
-    updateControls();
+    updateParseControls();
+    updateDownloadControls();
     try {
       const resource = await api.parse(url);
       if (generation !== parseGeneration || elements.urlInput.value.trim() !== url) return;
@@ -955,7 +1007,8 @@
     } finally {
       if (generation === parseGeneration) {
         parsing = false;
-        updateControls();
+        updateParseControls();
+        updateDownloadControls();
       }
     }
   }
@@ -963,23 +1016,25 @@
   async function selectDirectory() {
     if (!api || directoryLoading || selectingDirectory) return;
     selectingDirectory = true;
-    updateControls();
+    updateDownloadControls();
     try {
       const selected = await api.selectDirectory();
       if (typeof selected === 'string' && selected.trim()) {
         directory = selected;
         elements.directoryLabel.textContent = selected;
+        elements.directoryLabel.title = selected;
         elements.directoryPath.classList.add('has-value');
       }
     } catch (error) {
       showNotice(`选择文件夹失败：${errorMessage(error)}`, 'error');
     } finally {
       selectingDirectory = false;
-      updateControls();
+      updateDownloadControls();
     }
   }
 
   function activateDownload(task) {
+    delete elements.progressCard.dataset.outcome;
     activeTaskId = task.taskId;
     activeDownloadResource = task.resource;
     task.state = 'downloading';
@@ -1054,12 +1109,8 @@
     const taskId = activeTaskId;
     if (!api || !taskId || cancelling) return;
     flushDownloadProgress();
-    const previousStatus = elements.progressStatus.textContent;
-    const previousDetail = elements.progressDetail.textContent;
     const task = downloadTasks.get(taskId);
-    const previousTaskState = task.state;
     cancelling = true;
-    task.state = 'cancelling';
     renderTaskSummary(task);
     elements.progressStatus.textContent = '正在取消';
     elements.progressDetail.textContent = '正在停止下载任务…';
@@ -1070,10 +1121,10 @@
     } catch (error) {
       if (activeTaskId !== taskId) return;
       cancelling = false;
-      task.state = previousTaskState;
+      flushDownloadProgress();
       renderTaskSummary(task);
-      elements.progressStatus.textContent = previousStatus;
-      elements.progressDetail.textContent = previousDetail;
+      if (task.latestActivity) renderDownloadActivity(task.latestActivity);
+      else setProgress(task.percent || 0, '正在下载', '正在连接媒体服务器…');
       showNotice(`取消下载失败：${errorMessage(error)}`, 'error');
       updateControls();
     }
@@ -1087,6 +1138,7 @@
       if (!controls) {
         const row = document.createElement('div');
         row.className = 'download-list-row progress-video';
+        row.dataset.testid = 'progress-item';
         row.setAttribute('role', 'listitem');
         const title = document.createElement('span');
         title.className = 'progress-video-title';
@@ -1146,6 +1198,7 @@
           const [task] = queuedTasks.splice(queuedIndex, 1);
           updateTaskDetails(task, event);
           addTaskToHistory(task);
+          recordFinishedTask(task.taskId);
           applyFailedBatch(event.failedBatch);
           updateControls();
           return;
@@ -1243,53 +1296,48 @@
     } else {
       return;
     }
+    elements.progressCard.dataset.outcome = event.type;
     applyFailedBatch(event.failedBatch);
+    recordFinishedTask(event.taskId);
     finishProgressItem(event, counts);
     renderActiveVideos([]);
     activeTaskId = null;
     activeDownloadResource = null;
     cancelling = false;
     updateControls();
-  }
-
-  function bindConfirmation(trigger, dialog, cancelButton, confirmAction) {
-    trigger.addEventListener('click', () => {
-      if (trigger.disabled) return;
-      dialog.returnValue = '';
-      dialog.showModal();
-      cancelButton.focus();
-    });
-    dialog.addEventListener('close', () => {
-      if (dialog.returnValue === 'confirm') {
-        dialog.returnValue = '';
-        confirmAction();
-      }
-    });
+    if (event.type === 'cancelled') setText(elements.queueAnnouncement, event.message || '下载任务已取消。');
   }
 
   elements.noticeClose.addEventListener('click', hideNotice);
   elements.loginButton.addEventListener('click', openLogin);
+  elements.credentialsRefresh.addEventListener('click', refreshCredentials);
   elements.credentialsSave.addEventListener('click', () => changeCredentials('save'));
   elements.credentialsFill.addEventListener('click', () => changeCredentials('fill'));
   bindConfirmation(elements.credentialsDelete, elements.deleteCredentialsDialog,
-    elements.deleteCredentialsCancel, () => changeCredentials('delete'));
-  bindConfirmation(elements.logoutButton, elements.clearSessionDialog, elements.clearSessionCancel, logout);
+    elements.deleteCredentialsCancel, () => changeCredentials('delete'),
+    () => elements.credentialsSave.disabled ? elements.loginButton : elements.credentialsSave);
+  bindConfirmation(elements.logoutButton, elements.clearSessionDialog, elements.clearSessionCancel, logout, elements.loginButton);
   elements.parseForm.addEventListener('submit', parseResource);
-  elements.urlInput.addEventListener('input', () => {
+  function handleUrlInput() {
+    if (composingUrl) return;
     elements.urlInput.removeAttribute('aria-invalid');
     elements.urlHelp.textContent = urlHelpText;
     parseGeneration++;
     parsing = false;
     clearResource();
-  });
+  }
+  elements.urlInput.addEventListener('input', handleUrlInput);
   elements.urlInput.addEventListener('compositionstart', () => { composingUrl = true; });
-  elements.urlInput.addEventListener('compositionend', () => { composingUrl = false; });
+  elements.urlInput.addEventListener('compositionend', () => {
+    composingUrl = false;
+    handleUrlInput();
+  });
   elements.urlClear.addEventListener('click', () => {
     elements.urlInput.value = '';
     elements.urlInput.dispatchEvent(new Event('input', { bubbles: true }));
     elements.urlInput.focus();
   });
-  elements.formatSelect.addEventListener('change', updateControls);
+  elements.formatSelect.addEventListener('change', updateDownloadControls);
   elements.performerAll.addEventListener('change', () => {
     for (const checkbox of performerChecks) checkbox.checked = elements.performerAll.checked;
     updatePerformerSelection();
@@ -1321,36 +1369,39 @@
     return;
   }
 
-  api.onDownloadEvent(onDownloadEvent);
-  api.onLoginClosed(onLoginClosed);
-  api.onLoginWindowChanged?.(applyLoginWindowState);
-  api.concurrencyOptions?.().then(configureConcurrency).catch((error) => {
-    showNotice(`读取下载并发设置失败：${errorMessage(error)}`, 'error');
+  disposers.push(api.onDownloadEvent(onDownloadEvent));
+  disposers.push(api.onLoginClosed(onLoginClosed));
+  disposers.push(api.onLoginWindowChanged?.(applyLoginWindowState));
+  Promise.resolve().then(() => api.concurrencyOptions()).then(configureConcurrency).catch((error) => {
+    configureConcurrency({ fragment: [1, 4], video: [1, 2], defaults: { fragment: 1, video: 1 } });
+    showNotice(`读取下载并发设置失败，已使用默认设置：${errorMessage(error)}`, 'error');
   });
   if (typeof api.onSessionStatusChanged === 'function') {
-    api.onSessionStatusChanged((result) => {
+    disposers.push(api.onSessionStatusChanged((result) => {
       if (!applySessionStatus(result)) return;
       sessionRevision++;
-    });
+    }));
   }
   if (typeof api.credentialsStatus === 'function' && typeof api.onCredentialsChanged === 'function') {
-    api.onCredentialsChanged((result) => {
+    disposers.push(api.onCredentialsChanged((result) => {
       credentialsRevision++;
       setCredentialsStatus(result);
-    });
+    }));
   }
   elements.directoryLabel.textContent = '正在读取保存目录…';
   api.getDirectory().then((selected) => {
     if (typeof selected !== 'string' || !selected.trim()) throw new Error('没有可用的默认保存目录。');
     directory = selected;
     elements.directoryLabel.textContent = selected;
+    elements.directoryLabel.title = selected;
     elements.directoryPath.classList.add('has-value');
   }).catch((error) => {
     elements.directoryLabel.textContent = '请选择保存目录';
+    elements.directoryLabel.title = '';
     showNotice(`读取保存目录失败：${errorMessage(error)}`, 'error');
   }).finally(() => {
     directoryLoading = false;
-    updateControls();
+    updateDownloadControls();
   });
   if (typeof window.requestAnimationFrame === 'function') {
     // The form and its handlers are ready before opening the saved account session.

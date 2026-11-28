@@ -3,8 +3,9 @@
 const { randomUUID } = require('node:crypto');
 const { parsePlaylist } = require('./playlist');
 const {
-  normalizeResourceUrl, pageDisplayTitle, preferredVideoTitle, formatOptions, formatsFromInfo,
+  normalizeResourceUrl, pageDisplayTitle, preferredVideoTitle,
 } = require('./pornhub');
+const { formatOptions, formatsFromInfo } = require('./ytdlp-protocol');
 
 const MAX_SNAPSHOTS = 5;
 const BATCH_FORMATS = formatOptions([1080, 720, 480, 240]);
@@ -65,40 +66,46 @@ function createResourceParser({ fetchSitePage, captureMetadata }) {
       ...(resource.kind === 'pornstar' && { entries: videos.map(({ title, url }) => ({ title, url })) }) };
   }
 
-  async function resolveVideoTitle(video, task) {
-    if (video.downloadTitle || task?.cancelled) return;
-    if (task) task.titleAbortController ||= new AbortController();
+  async function resolveVideoTitle(video, { signal } = {}) {
+    if (video.downloadTitle || signal?.aborted) return;
     const title = await preferredVideoTitle(video.url,
-      (url) => fetchSitePage(url, { attempts: 1, timeoutMs: 10000, signal: task?.titleAbortController.signal }),
-      () => Boolean(task?.cancelled));
-    if (title && !task?.cancelled) {
+      (url) => fetchSitePage(url, { attempts: 1, timeoutMs: 10000, signal }),
+      () => Boolean(signal?.aborted));
+    if (title && !signal?.aborted) {
       video.title = title;
       video.downloadTitle = title;
     }
   }
 
-  async function parse(inputUrl) {
+  async function parse(inputUrl, { signal } = {}) {
+    signal?.throwIfAborted();
     const resource = normalizeResourceUrl(inputUrl);
     if (resource.kind === 'playlist') {
-      const { title, videos } = await parsePlaylist(resource, fetchSitePage);
-      return batchSnapshot(resource, title, videos);
+      const { title, videos, ...availability } = await parsePlaylist(resource, fetchSitePage, { signal });
+      return { ...batchSnapshot(resource, title, videos), ...availability };
     }
     const batch = resource.kind !== 'video';
     const info = await captureMetadata(resource, batch);
+    signal?.throwIfAborted();
     const { thumbnail } = info;
     if (batch) {
       const { videos } = info;
       let title = String(info.title || `${resource.id} 的视频`);
       if (resource.kind === 'pornstar') {
-        const html = await fetchSitePage(resource.url).catch(() => '');
+        const html = await fetchSitePage(resource.url, { signal }).catch(() => '');
+        signal?.throwIfAborted();
         title = pageDisplayTitle(html, 'pornstar', title);
       }
       return batchSnapshot(resource, title, videos, thumbnail);
     }
+    if (typeof info.id === 'string' && info.id.length && info.id.toLowerCase() !== resource.id.toLowerCase()) {
+      throw new Error('下载工具返回的视频 ID 与请求的链接不一致，请检查网页是否重定向。');
+    }
     const video = { url: resource.url, title: String(info.title) };
-    await resolveVideoTitle(video);
+    await resolveVideoTitle(video, { signal });
+    signal?.throwIfAborted();
     const snapshotId = remember({ ...resource, title: video.title, videos: [video] });
-    return { snapshotId, kind: 'video', id: String(info.id), title: video.title, thumbnail,
+    return { snapshotId, kind: 'video', id: resource.id, title: video.title, thumbnail,
       duration: info.duration, formats: info.formats };
   }
 

@@ -49,3 +49,12 @@ test('rejects incomplete playlist chunks and invalid page metadata', async () =>
     /缺少有效的分页信息/,
   );
 });
+
+test('partially available playlists report the declared and available counts', async () => {
+  const result = await parsePlaylist(resource, async (url) =>
+    url === resource.url ? pageHtml(38) : entriesHtml(
+      new URL(url).searchParams.get('page') === '1' ? range(1, 36) : [38]));
+  assert.equal(result.declaredCount, 38);
+  assert.equal(result.videos.length, 37);
+  assert.match(result.warning, /可下载 37 条.*删除/);
+});

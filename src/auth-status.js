@@ -36,16 +36,25 @@ function inspectSiteLoginState({ revealAccountMenu = false } = {}) {
     const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
     return Boolean(hit && (node.contains(hit) || hit === node.parentElement));
   }
-  const controls = [...document.querySelectorAll('a[href], button, [role="menuitem"], span, p, div')]
-    .filter((node) => node.matches('a[href], button, [role="menuitem"]') || node.childElementCount === 0)
-    .filter(visible);
-  const labels = controls.flatMap((node) => [
-    node.getAttribute('aria-label') || '',
-    typeof node.innerText === 'string' ? node.innerText : node.textContent || '',
-  ].map((value) => value.trim()).filter(Boolean));
-  const profile = labels.some((label) => /(?:查看您的个人资料|查看个人资料|view (?:your|my) profile)/i.test(label));
-  const logout = labels.some((label) => /^(?:注销|退出登录|log\s*out|sign\s*out)$/i.test(label));
-  const signIn = labels.some((label) => /^(?:登录|log\s*in|sign\s*in)$/i.test(label));
+  const selector = 'a[href], button, [role="menuitem"], span, p, div';
+  function inspectControls(query) {
+    const controls = [...document.querySelectorAll(query)]
+      .filter((node) => node.matches('a[href], button, [role="menuitem"]') || node.childElementCount === 0)
+      .filter(visible);
+    const labels = controls.flatMap((node) => [
+      node.getAttribute('aria-label') || '',
+      typeof node.innerText === 'string' ? node.innerText : node.textContent || '',
+    ].map((value) => value.trim()).filter(Boolean));
+    const profile = labels.some((label) => /(?:查看您的个人资料|查看个人资料|查看您的個人資料|查看個人資料|view (?:your|my) profile)/i.test(label));
+    const logout = labels.some((label) => /^(?:注销|退出登录|登出|log\s*out|sign\s*out)$/i.test(label));
+    const signIn = labels.some((label) => /^(?:登录|登入|log\s*in|sign\s*in)$/i.test(label));
+    return { profile, logout, signIn };
+  }
+  const headers = 'header, nav, [role="banner"], [role="navigation"], #header, #headerWrapper, #headerContainer';
+  let { profile, logout, signIn } = inspectControls(`:is(${headers}) :is(${selector})`);
+  if (!signIn && !(profile && logout)) {
+    ({ profile, logout, signIn } = inspectControls(selector));
+  }
   if (profile && logout && !signIn) return 'verified';
   if (signIn && !(profile && logout)) {
     // AJAX login can reuse the same header node. An observed anonymous menu
@@ -88,7 +97,18 @@ function createRevisionGate() {
 }
 
 function startStatusPolling(onTick, timers = { setInterval, clearInterval }) {
-  const timer = timers.setInterval(onTick, 2500);
+  let pending = false;
+  const timer = timers.setInterval(async () => {
+    if (pending) return;
+    pending = true;
+    try {
+      await onTick();
+    } catch {
+      // A navigation can invalidate the frame while polling.
+    } finally {
+      pending = false;
+    }
+  }, 2500);
   return () => timers.clearInterval(timer);
 }
 

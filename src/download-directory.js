@@ -1,11 +1,15 @@
+// @ts-check
 'use strict';
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { atomicWriteFile, createAsyncQueue } = require('./atomic-file');
+
+const serialize = createAsyncQueue();
 
 const SETTINGS_FILE = 'download-directory.json';
 
+/** @param {unknown} directory */
 async function validateDownloadDirectory(directory) {
   if (typeof directory !== 'string' || !path.isAbsolute(directory) || directory.length > 4096) {
     throw new Error('请先选择保存目录。');
@@ -15,7 +19,11 @@ async function validateDownloadDirectory(directory) {
   return directory;
 }
 
-async function loadDownloadDirectory(userDataDirectory, defaultDirectory) {
+/**
+ * @param {string} userDataDirectory
+ * @param {string} defaultDirectory
+ */
+async function readDirectory(userDataDirectory, defaultDirectory) {
   try {
     const settings = JSON.parse(await fs.readFile(path.join(userDataDirectory, SETTINGS_FILE), 'utf8'));
     return await validateDownloadDirectory(settings && settings.directory);
@@ -23,18 +31,24 @@ async function loadDownloadDirectory(userDataDirectory, defaultDirectory) {
   return defaultDirectory;
 }
 
-async function saveDownloadDirectory(userDataDirectory, directory) {
-  await validateDownloadDirectory(directory);
-  await fs.mkdir(userDataDirectory, { recursive: true });
-  const settingsFile = path.join(userDataDirectory, SETTINGS_FILE);
-  const temporaryFile = `${settingsFile}.${randomUUID()}.tmp`;
-  try {
-    await fs.writeFile(temporaryFile, JSON.stringify({ directory }), { encoding: 'utf8', flag: 'wx' });
-    await fs.rename(temporaryFile, settingsFile);
-  } finally {
-    await fs.rm(temporaryFile, { force: true }).catch(() => {});
-  }
-  return directory;
+/**
+ * @param {string} userDataDirectory
+ * @param {string} defaultDirectory
+ */
+function loadDownloadDirectory(userDataDirectory, defaultDirectory) {
+  return serialize(() => readDirectory(userDataDirectory, defaultDirectory));
+}
+
+/**
+ * @param {string} userDataDirectory
+ * @param {string} directory
+ */
+function saveDownloadDirectory(userDataDirectory, directory) {
+  return serialize(async () => {
+    await validateDownloadDirectory(directory);
+    await atomicWriteFile(path.join(userDataDirectory, SETTINGS_FILE), JSON.stringify({ directory }));
+    return directory;
+  });
 }
 
 module.exports = { loadDownloadDirectory, saveDownloadDirectory, validateDownloadDirectory };

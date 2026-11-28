@@ -6,7 +6,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const vm = require('node:vm');
+const { createAuthController } = require('../src/auth-window');
+const { registerIpc } = require('../src/ipc-handlers');
+const { authOptions } = require('./auth-window-fixture');
 const { createCredentialStore } = require('../src/credential-store');
 const { credentialPageOrigin, fillWindowCredentials, readWindowCredentials } = require('../src/login-credentials');
 
@@ -43,7 +45,10 @@ test('encrypted credentials survive reopening, can be replaced and deleted, and 
   assert.deepEqual(await store.status(), { available: true, saved: true });
   const reopened = createCredentialStore({ filePath, safeStorage });
   assert.deepEqual(await reopened.get(record.origin), record);
-  assert.equal(await reopened.get('https://pornhub.com'), null);
+  for (const origin of ['https://pornhub.com', 'https://cn.pornhub.com']) {
+    assert.deepEqual(await reopened.get(origin), { ...record, origin });
+  }
+  await assert.rejects(reopened.get('https://example.com'), /不允许/);
   await assert.rejects(reopened.get('https://www.pornhub.com.evil.test'), /不允许/);
   const version = reopened.revision();
   const replacement = { ...record, username: 'new-synthetic-user' };
@@ -158,7 +163,7 @@ test('fill cancels after navigation, frame replacement or credential deletion du
     const fixture = fakeWindow();
     const state = { revision: 0 };
     const store = { revision: () => state.revision, get: async () => { mutate(fixture, state); return record; } };
-    assert.deepEqual(await fillWindowCredentials(fixture.win, store), { filled: false });
+    assert.deepEqual(await fillWindowCredentials(fixture.win, store), { filled: false, status: 'stale', retryable: true });
     assert.equal(fixture.calls.length, 0);
   }
 });
@@ -172,35 +177,30 @@ test('credential capture rejects a switched frame instead of saving returned fie
   await assert.rejects(readWindowCredentials(fixture.win), /网页已切换/);
 });
 
-test('manual fill turns a navigation race into an error instead of a success notice', async () => {
-  const source = await fs.readFile(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-  const start = source.indexOf('async function fillLoginCredentials(');
-  const end = source.indexOf('async function deleteLoginCredentials(', start);
-  const context = { loginWindow: { isDestroyed: () => false }, credentialStore: {},
-    fillWindowCredentials: async () => ({ filled: false }) };
-  vm.createContext(context);
-  vm.runInContext(source.slice(start, end), context);
-  await assert.rejects(context.fillLoginCredentials(), /网页或保存的账号密码已变化/);
+test('manual fill turns a navigation race into an error instead of a success notice', async (t) => {
+  const fixture = authOptions(t);
+  fixture.options.credentialStore.get = async () => {
+    fixture.windows[0].url = 'https://example.com/';
+    return record;
+  };
+  const auth = createAuthController(fixture.options);
+  t.after(auth.stopLoginObservation);
+  auth.openLogin();
+  await assert.rejects(auth.fillLoginCredentials(), /网页或保存的账号密码已变化/);
 });
 
 test('every credential IPC rejects the remote login page and main-window subframes before access', async () => {
-  const source = await fs.readFile(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-  const guardStart = source.indexOf('function assertMainFrame(');
-  const guardEnd = source.indexOf('function isAllowedAuthUrl(', guardStart);
-  const ipcStart = source.indexOf('function registerIpc(');
-  const ipcEnd = source.indexOf('app.whenReady()', ipcStart);
   const handlers = new Map();
   const trustedContents = { mainFrame: {} };
   let calls = 0;
   const action = () => { calls++; return { saved: true }; };
-  const context = { ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
-    mainWindow: { webContents: trustedContents },
-    openLogin: action, sessionStatus: action, logout: action, credentialsStatus: action,
-    saveLoginCredentials: action, fillLoginCredentials: action, deleteLoginCredentials: action,
-    resourceParser: { parse: action },
-    downloadTasks: { startDownload: action, retryDownload: action, cancelDownload: action, removeQueuedDownload: action } };
-  vm.createContext(context);
-  vm.runInContext(source.slice(guardStart, guardEnd) + source.slice(ipcStart, ipcEnd) + '\nregisterIpc();', context);
+  registerIpc({
+    ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
+    getMainWindow: () => ({ isDestroyed: () => false, webContents: trustedContents }),
+    auth: { credentialsStatus: action, saveLoginCredentials: action,
+      fillLoginCredentials: action, deleteLoginCredentials: action },
+    downloadTasks: {},
+  });
   for (const channel of ['auth:credentials-status', 'auth:credentials-save',
     'auth:credentials-fill', 'auth:credentials-delete']) {
     const handler = handlers.get(channel);
@@ -211,4 +211,29 @@ test('every credential IPC rejects the remote login page and main-window subfram
   }
   handlers.get('auth:credentials-status')({ sender: trustedContents, senderFrame: trustedContents.mainFrame });
   assert.equal(calls, 1);
+});
+
+test('deleting credentials while the login form is being read invalidates the pending save', async (t) => {
+  const { store } = await storeHarness(t);
+  await store.save(record);
+  const fixture = authOptions(t, { credentialStore: store });
+  const auth = createAuthController(fixture.options);
+  t.after(auth.stopLoginObservation);
+  auth.openLogin();
+  const win = fixture.windows[0];
+  win.url = record.origin + '/login';
+  let finishRead;
+  win.webContents.mainFrame.executeJavaScript = () => new Promise((resolve) => { finishRead = resolve; });
+  const saving = auth.saveLoginCredentials();
+  await auth.deleteLoginCredentials();
+  finishRead(record);
+  await assert.rejects(saving, /保存已被删除或覆盖/);
+  assert.equal(await store.get(record.origin), null);
+});
+
+test('Linux basic_text cannot store credentials', { skip: process.platform !== 'linux' }, async (t) => {
+  const { store, safeStorage } = await storeHarness(t);
+  safeStorage.getSelectedStorageBackend = () => 'basic_text';
+  assert.deepEqual(await store.status(), { available: false, saved: false });
+  await assert.rejects(store.save(record), /系统加密不可用/);
 });

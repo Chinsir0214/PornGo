@@ -3,13 +3,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
+const os = require('node:os');
 const path = require('node:path');
 const { loadDownloadDirectory, saveDownloadDirectory, validateDownloadDirectory } = require('../src/download-directory');
 
 async function testDirectories(t) {
-  const root = path.join(__dirname, '..', 'downtest');
-  await fs.mkdir(root, { recursive: true });
-  const sandbox = await fs.mkdtemp(path.join(root, 'directory-settings-'));
+  const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), 'directory-settings-'));
   t.after(() => fs.rm(sandbox, { recursive: true, force: true }));
   const userData = path.join(sandbox, 'user-data');
   const downloads = path.join(sandbox, 'Downloads');

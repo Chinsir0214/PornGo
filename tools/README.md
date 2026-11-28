@@ -30,6 +30,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-tools.ps1 
 
 `tools/*.exe` 被 Git 忽略。工具清单锁定了具体发布版本和校验值。BtbN 仅保留最近 14 个每日构建和最近两年的月末构建，旧标签过期后下载可能返回 404。[上游保留策略](https://github.com/FFmpeg-Builds/FFmpeg-Builds#release-retention-policy)
 
-1. 下载并安装 Windows 安装版 `PornGo-0.9.4-setup.exe`。[PornGo v0.9.4](https://github.com/Chinsir0214/PornGo/releases/tag/v0.9.4)
+下次更新 FFmpeg 时，建议选用 BtbN 的月末构建，以便在较长时间内从原地址下载。
+
+1. 下载并安装 Windows 安装版 `PornGo-0.9.7-setup.exe`。[PornGo v0.9.7](https://github.com/Chinsir0214/PornGo/releases/tag/v0.9.7)
 2. 将安装目录 `resources\tools` 中的 `yt-dlp.exe` 和 `ffmpeg.exe` 复制到仓库的 `tools` 目录。
 3. 在仓库根目录运行 `npm run verify:tools`。校验通过后即可运行 `npm start` 或继续打包。

@@ -4,6 +4,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -51,7 +53,16 @@ function Test-Sha256([string] $Path, [string] $Expected) {
 function Get-VerifiedFile([string] $Url, [string] $Destination, [string] $Expected) {
     if ($Url -notmatch '^https://github\.com/') { throw "Unexpected download host: $Url" }
     Write-Host "Downloading $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $Destination -MaximumRedirection 10
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Destination -MaximumRedirection 10 -UseBasicParsing -TimeoutSec 300
+            break
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Write-Warning "Download attempt $attempt failed. Retrying $Url"
+            Start-Sleep -Seconds $attempt
+        }
+    }
     Assert-Sha256 $Destination $Expected
 }
 
@@ -105,8 +116,7 @@ try {
     }
     Write-Host 'Bundled tools match tools/tool-versions.json.'
 } finally {
-    foreach ($path in @($ytStage, $ffmpegArchive, $ffmpegStage)) {
-        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    if (Test-Path -LiteralPath $stage) {
+        Remove-Item -LiteralPath $stage -Recurse -Force
     }
-    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage }
 }

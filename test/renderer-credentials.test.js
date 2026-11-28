@@ -2,31 +2,17 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
+const { createRendererHarness } = require('./helpers/renderer-harness');
+const { createPreloadHarness } = require('./helpers/preload-harness');
 
 const flush = () => new Promise(setImmediate);
 
 function rendererFixture(overrides = {}) {
-  const elements = new Map();
-  function element(key) {
-    if (!elements.has(key)) elements.set(key, {
-      value: '', textContent: '', hidden: false, disabled: false,
-      dataset: {}, style: {}, handlers: {}, returnValue: '', modal: false,
-      classList: { add() {}, remove() {}, toggle() {} },
-      addEventListener(name, callback) { this.handlers[name] = callback; },
-      setAttribute() {}, removeAttribute() {}, replaceChildren() {}, focus() {},
-      showModal() { this.modal = true; },
-    });
-    return elements.get(key);
-  }
   let changed;
   let windowChanged;
   const calls = [];
   const status = { available: true, saved: false };
   const api = {
-    getDirectory: async () => path.join(__dirname, '..', 'downtest'),
     sessionStatus: async () => ({ cookieCount: 0, loginState: 'empty' }),
     onDownloadEvent() {}, onLoginClosed() {}, openLogin: async () => ({ windowOpen: true, revision: 1 }),
     onLoginWindowChanged(callback) { windowChanged = callback; },
@@ -43,9 +29,7 @@ function rendererFixture(overrides = {}) {
     },
     ...overrides,
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer.js'), 'utf8'), {
-    window: { porngo: api }, document: { getElementById: element, querySelector: element },
-  });
+  const { element } = createRendererHarness(api);
   return { element, calls, changed: (payload) => changed(payload), windowChanged: (payload) => windowChanged(payload) };
 }
 
@@ -55,25 +39,25 @@ test('credentials require explicit save, permit manual fill, and delete only aft
   await flush();
   assert.equal(calls.length, 0);
   assert.equal(element('credentials-save').disabled, true, 'closed login window cannot save');
-  await element('login-button').handlers.click();
+  await element('login-button').dispatch('click');
   assert.equal(element('credentials-save').disabled, false);
-  await element('credentials-save').handlers.click();
+  await element('credentials-save').dispatch('click');
   assert.equal(element('credentials-save').textContent, '更新网页登录账号密码');
   assert.equal(element('credentials-fill').hidden, false);
-  await element('credentials-fill').handlers.click();
-  element('credentials-delete').handlers.click();
-  assert.equal(element('delete-credentials-dialog').modal, true);
+  await element('credentials-fill').dispatch('click');
+  element('credentials-delete').dispatch('click');
+  assert.equal(element('delete-credentials-dialog').open, true);
   element('delete-credentials-dialog').returnValue = 'cancel';
-  element('delete-credentials-dialog').handlers.close();
+  element('delete-credentials-dialog').dispatch('close');
   assert.equal(calls.filter(([name]) => name === 'delete').length, 0);
   element('delete-credentials-dialog').returnValue = 'confirm';
-  element('credentials-delete').handlers.click();
+  element('credentials-delete').dispatch('click');
   assert.equal(element('delete-credentials-dialog').returnValue, '');
-  element('delete-credentials-dialog').handlers.close();
+  element('delete-credentials-dialog').dispatch('close');
   assert.equal(calls.filter(([name]) => name === 'delete').length, 0);
-  element('credentials-delete').handlers.click();
+  element('credentials-delete').dispatch('click');
   element('delete-credentials-dialog').returnValue = 'confirm';
-  element('delete-credentials-dialog').handlers.close();
+  element('delete-credentials-dialog').dispatch('close');
   await flush();
   assert.deepEqual(calls, [['save', []], ['fill', []], ['delete', []]], 'renderer never sends password fields');
   assert.equal(element('credentials-delete').hidden, true);
@@ -90,10 +74,10 @@ test('save rejects duplicate requests and restores usable controls after failure
     },
   });
   await flush();
-  await element('login-button').handlers.click();
-  const saving = element('credentials-save').handlers.click();
+  await element('login-button').dispatch('click');
+  const saving = element('credentials-save').dispatch('click');
   assert.equal(element('credentials-save').disabled, true);
-  await element('credentials-save').handlers.click();
+  await element('credentials-save').dispatch('click');
   assert.equal(saveCount, 1);
   rejectSave(new Error('请先填写网页登录表单'));
   await saving;
@@ -120,7 +104,7 @@ test('a cancelled fill does not show a success notice', async () => {
   await flush();
   fixture.windowChanged({ windowOpen: true, revision: 1 });
   fixture.changed({ available: true, saved: true });
-  await fixture.element('credentials-fill').handlers.click();
+  await fixture.element('credentials-fill').dispatch('click');
   assert.match(fixture.element('notice-message').textContent, /填充账号密码失败/);
   assert.equal(fixture.element('credentials-fill').disabled, false);
 });
@@ -133,23 +117,28 @@ test('corrupt credential status disables fill while retaining update and deletio
   assert.equal(fixture.element('credentials-fill').disabled, true);
   assert.equal(fixture.element('credentials-delete').disabled, false);
   assert.equal(fixture.element('credentials-save').disabled, false);
-  await fixture.element('credentials-fill').handlers.click();
+  await fixture.element('credentials-fill').dispatch('click');
   assert.equal(fixture.calls.length, 0);
 });
 
 test('preload exposes only specific credential actions without arbitrary arguments', async () => {
-  let exposed;
-  const calls = [];
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'preload.js'), 'utf8'), {
-    require: () => ({
-      contextBridge: { exposeInMainWorld(_name, api) { exposed = api; } },
-      ipcRenderer: { invoke: async (...args) => { calls.push(args); }, on() {}, removeListener() {} },
-    }),
-  });
+  const { api: exposed, calls } = createPreloadHarness();
   for (const method of ['credentialsStatus', 'saveCredentials', 'fillCredentials', 'deleteCredentials']) {
     await exposed[method]({ password: 'never sent' });
   }
   assert.deepEqual(calls.map((args) => [...args]), [
     ['auth:credentials-status'], ['auth:credentials-save'], ['auth:credentials-fill'], ['auth:credentials-delete'],
   ]);
+});
+
+test('deleting credentials with the login window closed restores focus to the login button', async () => {
+  const { element, changed } = rendererFixture();
+  await flush();
+  changed({ available: true, saved: true });
+  await element('credentials-delete').dispatch('click');
+  const dialog = element('delete-credentials-dialog');
+  dialog.returnValue = 'confirm';
+  await dialog.dispatch('close');
+  assert.equal(element('credentials-delete').hidden, true);
+  assert.equal(dialog.ownerDocument.activeElement, element('login-button'));
 });

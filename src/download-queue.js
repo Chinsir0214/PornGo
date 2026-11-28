@@ -1,14 +1,25 @@
+// @ts-check
 'use strict';
 
 const MAX_DOWNLOAD_ATTEMPTS = 3;
 const FRAGMENT_CONCURRENCY = [1, 4];
 const VIDEO_CONCURRENCY = [1, 2];
 
+/**
+ * @param {number} value
+ * @param {number[]} allowed
+ * @param {string} label
+ */
 function validateConcurrency(value, allowed, label) {
   if (!allowed.includes(value)) throw new Error(`${label}参数无效。`);
   return value;
 }
 
+/**
+ * @param {string} kind
+ * @param {number} fragmentConcurrency
+ * @param {number} videoConcurrency
+ */
 function validateDownloadConcurrency(kind, fragmentConcurrency, videoConcurrency) {
   const fragments = validateConcurrency(fragmentConcurrency, FRAGMENT_CONCURRENCY, '分片并发数');
   const videos = validateConcurrency(videoConcurrency, VIDEO_CONCURRENCY, '同时下载视频数');
@@ -16,23 +27,49 @@ function validateDownloadConcurrency(kind, fragmentConcurrency, videoConcurrency
   return { fragmentConcurrency: fragments, videoConcurrency: videos };
 }
 
+/**
+ * @param {number} finishedAttempts
+ * @param {number} plannedAttempts
+ * @param {ReadonlyMap<string, number>} activeProgress
+ */
 function queueProgressPercent(finishedAttempts, plannedAttempts, activeProgress) {
   if (!plannedAttempts) return 0;
   const active = [...activeProgress.values()].reduce((sum, value) => sum + Math.min(90, value) / 100, 0);
   return Math.min(99, (finishedAttempts + active) / plannedAttempts * 100);
 }
 
+/** @template T @typedef {{video: T, index: number, attempt: number}} QueueItem */
+/** @template T @typedef {{item: QueueItem<T>, finishedAttempts: number, plannedAttempts: number}} Attempt */
+/** @template T @typedef {Attempt<T> & {percent: number, activeCount: number, retryCount: number}} QueueEvent */
+/** @typedef {{completedCount: number, failedCount: number}} Counts */
+/** @typedef {Counts & {activeCount: number, itemCount: number, retryCount: number} & Record<string, unknown>} ProgressDetails */
+/** @typedef {(percent: number, details?: Record<string, unknown>) => void} ReportProgress */
+
+/**
+ * @template T
+ * @param {T[]} videos
+ * @param {object} options
+ * @param {(attempt: Attempt<T> & {reportProgress: ReportProgress}) => unknown} options.download
+ * @param {(event: QueueEvent<T>) => void} [options.onStart]
+ * @param {(event: QueueEvent<T> & {error: string}) => void} [options.onRetry]
+ * @param {(event: QueueEvent<T> & Counts & {error: string | null}) => void} [options.onSettled]
+ * @param {(event: {item: QueueItem<T>, percent: number, itemPercent?: number, details: ProgressDetails}) => void} [options.onProgress]
+ * @param {() => boolean} [options.isCancelled]
+ * @param {number} [options.concurrency]
+ */
 async function processDownloadQueue(videos, {
   download, onStart = () => {}, onRetry = () => {}, onSettled = () => {},
   onProgress = () => {}, isCancelled = () => false, concurrency = 1,
 }) {
   validateConcurrency(concurrency, VIDEO_CONCURRENCY, '同时下载视频数');
   const queue = videos.map((video, index) => ({ video, index, attempt: 1 }));
+  /** @type {Map<string, number>} */
   const activeProgress = new Map();
   let completedCount = 0;
   let failedCount = 0;
   let finishedAttempts = 0;
   let plannedAttempts = queue.length;
+  /** @type {string[]} */
   const failures = [];
   let peakPercent = 0;
   let retryCount = 0;
@@ -45,30 +82,35 @@ async function processDownloadQueue(videos, {
   const worker = async () => {
     while (queue.length && !isCancelled()) {
       const item = queue.shift();
+      if (!item) break;
       if (item.attempt > 1) retryCount--;
       const key = `${item.index}:${item.attempt}`;
       activeProgress.set(key, 0);
       onStart({ item, finishedAttempts, plannedAttempts, percent: progress(),
         activeCount: activeProgress.size, retryCount });
+      /** @type {ReportProgress} */
       const reportProgress = (percent, details = {}) => {
-        if (isCancelled()) return;
+        if (isCancelled() || !activeProgress.has(key)) return;
         const bounded = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0;
         activeProgress.set(key, Math.max(activeProgress.get(key) || 0, bounded));
         onProgress({ item, percent: progress(), itemPercent: Number.isFinite(percent) ? activeProgress.get(key) : undefined,
           details: { ...details, completedCount, failedCount,
           activeCount: activeProgress.size, itemCount: videos.length, retryCount } });
       };
-      let error;
+      let failure;
       try {
-        error = await download({ item, finishedAttempts, plannedAttempts, reportProgress });
+        failure = await download({ item, finishedAttempts, plannedAttempts, reportProgress });
       } catch (caught) {
-        error = String(caught && (caught.message || caught));
+        failure = caught || new Error('下载失败。');
       }
       activeProgress.delete(key);
       if (isCancelled()) break;
       finishedAttempts++;
 
-      if (error && item.attempt < MAX_DOWNLOAD_ATTEMPTS) {
+      const reason = failure && (typeof failure === 'object' || typeof failure === 'function') ? failure : {};
+      const error = failure ? String(('message' in reason && reason.message) || failure) : null;
+      if (error && !('retryable' in reason && reason.retryable === false)
+          && !('code' in reason && reason.code === 'ENOENT') && item.attempt < MAX_DOWNLOAD_ATTEMPTS) {
         const retry = { ...item, attempt: item.attempt + 1 };
         queue.push(retry);
         retryCount++;

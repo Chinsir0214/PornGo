@@ -9,7 +9,17 @@ const FILE_METADATA_PREFIX = 'PORNGO_FILE:';
 // The empty fallback cannot match .+, so missing dates do not create a tag.
 const CREATION_TIME_MAPPING = '%(timestamp>%Y-%m-%dT%H\\:%M\\:%SZ,upload_date>%Y-%m-%dT00\\:00\\:00Z|)s:(?P<meta_creation_time>.+)';
 
-function artifactYtdlpArgs(directory, title) {
+function outputTemplate(directory, videoUrl) {
+  if (process.platform !== 'win32') return OUTPUT_TEMPLATE;
+  // Leave room for the separator, video ID, extension and temporary format suffix.
+  const idLength = /[?&]viewkey=([a-z0-9]+)/i.exec(videoUrl || '')?.[1].length || 16;
+  const available = 259 - path.resolve(directory).length - idLength - 21;
+  if (available < 1) throw new Error('下载路径过长，请选择较短的保存目录后重试。');
+  const bytes = Math.min(180, Math.max(40, available));
+  return OUTPUT_TEMPLATE.replace('180B', `${bytes}B`);
+}
+
+function artifactYtdlpArgs(directory, title, videoUrl) {
   return [
     '--no-overwrites', '--embed-metadata', '--no-embed-info-json', '--no-mtime',
     // Python replacement strings interpret backslashes; the title is otherwise
@@ -20,7 +30,7 @@ function artifactYtdlpArgs(directory, title) {
     ] : []),
     '--parse-metadata', CREATION_TIME_MAPPING,
     '--print', `after_move:${FILE_METADATA_PREFIX}%(.{filepath,timestamp,upload_date})j`,
-    '--progress', '-P', directory, '-o', OUTPUT_TEMPLATE,
+    '--progress', '-P', directory, '-o', outputTemplate(directory, videoUrl),
   ];
 }
 
@@ -46,20 +56,34 @@ function publicationDate(record) {
     ? date : null;
 }
 
-async function applyPublicationTime(record, directory) {
+function comparablePath(file, platform) {
+  if (platform !== 'win32') return file;
+  return file.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').toLowerCase();
+}
+
+async function applyPublicationTime(record, directory, { fs = fsp, platform = process.platform } = {}) {
   const date = publicationDate(record);
   if (!date) return;
-  const file = path.resolve(record.filepath);
-  // Only the final media in this task's destination may receive a timestamp.
-  if (path.dirname(file) !== path.resolve(directory)) {
-    throw new Error('视频输出路径不在下载目录中。');
+  const paths = platform === 'win32' ? path.win32 : path.posix;
+  const file = paths.resolve(record.filepath);
+  const destination = paths.resolve(directory);
+  const inDestination = (name, folder) => paths.dirname(comparablePath(name, platform)) ===
+    comparablePath(folder, platform);
+  try {
+    // Only the final media in this task's destination may receive a timestamp.
+    if (!inDestination(file, destination)) throw new Error('视频输出路径不在下载目录中。');
+    const [realFile, realDirectory] = await Promise.all([fs.realpath(file), fs.realpath(destination)]);
+    if (!inDestination(realFile, realDirectory)) throw new Error('视频输出路径不在下载目录中。');
+    const stat = await fs.stat(realFile);
+    if (!stat.isFile()) throw new Error('视频输出路径不是文件。');
+    await fs.utimes(realFile, stat.atime, date);
+  } catch (error) {
+    error.retryable = false;
+    throw error;
   }
-  const stat = await fsp.stat(file);
-  if (!stat.isFile()) throw new Error('视频输出路径不是文件。');
-  await fsp.utimes(file, stat.atime, date);
 }
 
 module.exports = {
-  OUTPUT_TEMPLATE, FILE_METADATA_PREFIX, artifactYtdlpArgs,
+  OUTPUT_TEMPLATE, FILE_METADATA_PREFIX, outputTemplate, artifactYtdlpArgs,
   parseFileMetadata, publicationDate, applyPublicationTime,
 };

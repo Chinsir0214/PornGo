@@ -2,83 +2,22 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-const { EventEmitter } = require('node:events');
-const { createRevisionGate, inspectSiteLoginState, resolveObservedLogin } = require('../src/auth-status');
+const { createAuthController } = require('../src/auth-window');
+const { authOptions } = require('./auth-window-fixture');
 
 const flush = () => new Promise(setImmediate);
-
-function authHarness() {
-  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
-  const start = source.indexOf('async function readSessionStatus(');
-  const end = source.indexOf('function credentialsStatus(', start);
-  const windows = [];
-  const events = [];
-  const timers = new Map();
-  let nextTimer = 0;
-  let cookies = 3;
-  let observe = async () => 'unknown';
-  let poll;
-  class FakeWindow extends EventEmitter {
-    constructor() {
-      super();
-      this.destroyed = false;
-      this.closeCalls = 0;
-      this.webContents = new EventEmitter();
-      this.webContents.setWindowOpenHandler = () => {};
-      this.webContents.getURL = () => this.url;
-      this.webContents.executeJavaScript = () => observe(this);
-      windows.push(this);
-    }
-    isDestroyed() { return this.destroyed; }
-    isMinimized() { return false; }
-    show() {}
-    focus() {}
-    async loadURL(url) { this.url = url; }
-    close() {
-      this.closeCalls++;
-      let prevented = false;
-      this.emit('close', { preventDefault: () => { prevented = true; } });
-      if (!prevented) { this.destroyed = true; this.emit('closed'); }
-    }
-  }
-  const context = {
-    BrowserWindow: FakeWindow, ICON_PATH: 'icon', AUTH_PARTITION: 'auth',
-    setWindowAppDetails: () => {},
-    setupLoginCredentials: () => {},
-    mainWindow: { isDestroyed: () => false, webContents: { send: (type, result) => events.push({ type, result }) } },
-    loginWindow: null, loginWindowRevision: 0, clearingSession: false, recentlyVerifiedLogin: false,
-    loginClosePending: false, loginCloseApproved: false, stopAuthPolling: null,
-    authRevision: createRevisionGate(), inspectSiteLoginState, resolveObservedLogin,
-    siteCookies: async () => Array(cookies).fill({}),
-    isAllowedAuthUrl: (url) => typeof url === 'string' && url.startsWith('https://www.pornhub.com/'),
-    startStatusPolling: (callback) => { poll = callback; return () => { poll = null; }; },
-    authSession: () => ({ clearStorageData: async () => { cookies = 0; } }),
-    dialog: { showErrorBox() {} },
-    setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, delay }); return id; },
-    clearTimeout: (id) => timers.delete(id),
-  };
-  vm.createContext(context);
-  vm.runInContext(source.slice(start, end)
-    + '\nglobalThis.authApi = { openLogin, scheduleSessionStatusUpdate, logout };', context);
-  return {
-    ...context.authApi, context, windows, events,
-    observe: (callback) => { observe = callback; },
-    tick: () => { if (poll) poll(); },
-    runStatusTimer: async () => {
-      const entry = [...timers].find(([, timer]) => timer.delay === 500);
-      assert.ok(entry, 'status timer should be scheduled');
-      timers.delete(entry[0]);
-      await entry[1].callback();
-      await flush();
-    },
+function authHarness(t) {
+  const fixture = authOptions(t);
+  const auth = createAuthController(fixture.options);
+  t.after(auth.stopLoginObservation);
+  return { ...fixture, ...auth,
+    runStatusTimer: async () => { t.mock.timers.tick(500); await flush(); },
+    tick: () => t.mock.timers.tick(2500),
   };
 }
 
-test('verified login promptly updates the main window, closes only the login window, and preserves confirmation', async () => {
-  const auth = authHarness();
+test('verified login promptly updates the main window, closes only the login window, and preserves confirmation', async (t) => {
+  const auth = authHarness(t);
   auth.openLogin();
   auth.observe(async () => 'verified');
   auth.windows[0].webContents.emit('did-finish-load');
@@ -88,11 +27,11 @@ test('verified login promptly updates the main window, closes only the login win
   assert.deepEqual(auth.events.filter(({ type }) => type !== 'auth:window-changed').map(({ type, result }) => [type, result.loginState]), [
     ['auth:status-changed', 'verified'], ['auth:closed', 'recently_verified'],
   ]);
-  assert.equal(auth.context.loginWindow, null);
+  assert.equal(auth.events.filter(({ type }) => type === 'auth:window-changed').at(-1).result.windowOpen, false);
 });
 
-test('saved anonymous cookies do not close the login window and same-page polling detects later success', async () => {
-  const auth = authHarness();
+test('saved anonymous cookies do not close the login window and same-page polling detects later success', async (t) => {
+  const auth = authHarness(t);
   auth.openLogin();
   auth.observe(async () => 'signed_out');
   auth.windows[0].webContents.emit('did-finish-load');
@@ -106,13 +45,13 @@ test('saved anonymous cookies do not close the login window and same-page pollin
   assert.equal(auth.events.at(-1).result.loginState, 'recently_verified');
 });
 
-test('an old verification result cannot close a replacement login window', async () => {
-  const auth = authHarness();
+test('an old verification result cannot close a replacement login window', async (t) => {
+  const auth = authHarness(t);
   auth.openLogin();
   const oldWindow = auth.windows[0];
   let finishObservation;
   auth.observe(() => new Promise((resolve) => { finishObservation = resolve; }));
-  auth.scheduleSessionStatusUpdate();
+  auth.windows.at(-1).webContents.emit('did-navigate');
   const pending = auth.runStatusTimer();
   await flush();
   oldWindow.destroyed = true;
@@ -122,22 +61,22 @@ test('an old verification result cannot close a replacement login window', async
   finishObservation('verified');
   await pending;
   assert.equal(auth.windows[1].closeCalls, 0);
-  assert.equal(auth.context.recentlyVerifiedLogin, false);
+  assert.equal(auth.events.some(({ result }) => result.loginState === 'recently_verified'), false);
 });
 
-test('logout invalidates an in-flight verification and retains empty session state', async () => {
-  const auth = authHarness();
+test('logout invalidates an in-flight verification and retains empty session state', async (t) => {
+  const auth = authHarness(t);
   const opened = auth.openLogin();
   let finishObservation;
   auth.observe(() => new Promise((resolve) => { finishObservation = resolve; }));
-  auth.scheduleSessionStatusUpdate();
+  auth.windows.at(-1).webContents.emit('did-navigate');
   const pending = auth.runStatusTimer();
   await flush();
   const result = await auth.logout();
   finishObservation('verified');
   await pending;
   assert.equal(result.loginState, 'empty');
-  assert.equal(auth.context.recentlyVerifiedLogin, false);
+  assert.equal(auth.events.some(({ result }) => result.loginState === 'recently_verified'), false);
   assert.equal(auth.events.some(({ result: event }) => event.loginState === 'verified'), false);
   assert.deepEqual(auth.events.filter(({ type }) => type === 'auth:window-changed')
     .map(({ result }) => [result.windowOpen, result.revision]), [
@@ -145,11 +84,11 @@ test('logout invalidates an in-flight verification and retains empty session sta
   ]);
 });
 
-test('closing a signed-out login window and reopening advances independent revisions', async () => {
-  const auth = authHarness();
+test('closing a signed-out login window and reopening advances independent revisions', async (t) => {
+  const auth = authHarness(t);
   const opened = auth.openLogin();
   auth.observe(async () => 'signed_out');
-  auth.scheduleSessionStatusUpdate();
+  auth.windows.at(-1).webContents.emit('did-navigate');
   await auth.runStatusTimer();
   const focused = auth.openLogin();
   assert.equal(focused.revision, opened.revision);

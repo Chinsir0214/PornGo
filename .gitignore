@@ -10,6 +10,7 @@ node_modules/
 
 # Local development, testing and audit output
 /.codex/
+/.serena/
 /AGENTS.md
 /scripts/lsp-mcp.js
 /.tmp/

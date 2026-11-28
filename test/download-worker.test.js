@@ -7,6 +7,8 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { observeTaskkill } = require('./taskkill-fixture');
+const { terminateProcessTree } = require('../src/download-process');
 const { createDownloadWorker } = require('../src/download-worker-client');
 
 // Node's IPC channel transports the same messages as Electron's utility process.
@@ -96,7 +98,16 @@ test('forced utility loss reaps both the downloader and the independent muxer it
       utility.on('message', (message) => { if (message.type === 'child' && message.pid) rootPid = message.pid; });
       return utility;
     });
-    t.after(() => client.close());
+    t.after(async () => {
+      try { await client.close(); }
+      finally {
+        for (const pid of [muxerPid, rootPid]) {
+          if (pid) {
+            try { process.kill(pid); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+          }
+        }
+      }
+    });
     const script = [
       "const {spawn} = require('node:child_process');",
       "const helper = spawn(process.execPath, ['-e','setTimeout(()=>{},20000)'], {windowsHide:true,detached:true,stdio:'ignore'});",
@@ -110,7 +121,13 @@ test('forced utility loss reaps both the downloader and the independent muxer it
     utility.kill();
     await failed;
     assert.throws(() => process.kill(rootPid, 0), { code: 'ESRCH' });
-    assert.throws(() => process.kill(muxerPid, 0), { code: 'ESRCH' });
+    try { process.kill(muxerPid, 0); }
+    catch (error) { if (error.code === 'ESRCH') return; throw error; }
+    // Diagnose a surviving muxer with the same executable and token.
+    const probe = observeTaskkill();
+    const killed = await terminateProcessTree({ pid: muxerPid, kill() {} }, { spawnProcess: probe.spawnProcess });
+    if (!killed && probe.restricted()) return t.skip('Sandbox restricted taskkill');
+    assert.fail('Muxer survived worker cleanup: ' + probe.diagnostic());
   });
 
 test('IPC failure settles pending jobs on exit and a subsequent request can launch another worker', async () => {
@@ -129,4 +146,13 @@ test('IPC failure settles pending jobs on exit and a subsequent request can laun
   assert.equal(await client.request('metadata', {}), 'ok');
   await client.close();
   assert.equal(launches, 2);
+});
+
+test('worker spawn error without exit settles pending work and close', { timeout: 1000 }, async () => {
+  const child = Object.assign(new EventEmitter(), { postMessage() {}, kill: () => false });
+  const client = createDownloadWorker(() => child);
+  const failed = assert.rejects(client.request('metadata', {}), /spawn failed/);
+  const closing = client.close();
+  child.emit('error', new Error('spawn failed'));
+  await Promise.all([failed, closing]);
 });

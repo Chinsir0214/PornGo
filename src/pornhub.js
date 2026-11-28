@@ -1,5 +1,7 @@
 'use strict';
 
+const ytdlpProtocol = require('./ytdlp-protocol');
+
 const SITE_HOST = 'pornhub.com';
 const PREMIUM_HOST = 'pornhubpremium.com';
 
@@ -83,13 +85,14 @@ function normalizeResourceUrl(input) {
 function playlistEntriesFromHtml(html) {
   const entries = [];
   const seen = new Set();
-  const pattern = /href="\/?view_video\.php\?[^"\s]*\bviewkey=([a-zA-Z0-9]{4,64})[^"]*"[^>]*\s+title="([^"]+)"/g;
-  for (const match of String(html).matchAll(pattern)) {
-    const id = match[1];
-    if (seen.has(id)) continue;
+  for (const [tag] of String(html).matchAll(/<a\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi)) {
+    const { href, title } = htmlAttributes(tag);
+    if (!title || !/^\/?view_video\.php\?/i.test(href || '')) continue;
+    const params = new URLSearchParams(href.split('?')[1].split('#')[0]);
+    const id = params.get('viewkey');
+    if (!/^[a-zA-Z0-9]{4,64}$/.test(id || '') || params.getAll('viewkey').length !== 1 || seen.has(id)) continue;
     seen.add(id);
-    entries.push({ url: `https://www.pornhub.com/view_video.php?viewkey=${id}`,
-      title: match[2].slice(0, 180) });
+    entries.push({ url: `https://www.pornhub.com/view_video.php?viewkey=${id}`, title: title.slice(0, 180) });
   }
   return entries;
 }
@@ -110,7 +113,7 @@ function decodeHtmlText(value) {
 function pageDisplayTitle(html, kind, fallback) {
   const raw = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(String(html))?.[1];
   if (!raw) return fallback;
-  let title = decodeHtmlText(raw).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  let title = decodeHtmlText(raw.replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
   title = title.replace(/\s*\|\s*Pornhub(?:\.com)?\s*$/i, '').trim();
   if (kind === 'playlist') title = title.replace(/\s*-\s*来自.+的色情片片单\s*$/, '').trim();
   if (kind === 'pornstar') {
@@ -174,7 +177,11 @@ function videoTitlesFromHtml(html, resource) {
       const url = new URL(attributes.href, resource.url);
       const alternate = normalizeResourceUrl(url.href);
       if (url.protocol !== 'https:' || alternate.kind !== 'video' || alternate.id !== resource.id) continue;
-      alternatives.push({ url: url.href, language: alternateLanguage });
+      const locale = url.searchParams.get('lang');
+      const canonical = new URL(alternate.url);
+      canonical.hostname = url.hostname;
+      if (chineseTitleLanguage(locale) === alternateLanguage) canonical.searchParams.set('lang', locale);
+      alternatives.push({ url: canonical.href, language: alternateLanguage });
     } catch { /* Ignore unsupported or unrelated alternate links. */ }
   }
   return { original, translated: translated !== original ? translated : '', language, alternatives };
@@ -188,7 +195,8 @@ async function preferredVideoTitle(inputUrl, fetchPage, isCancelled = () => fals
   let original = '';
   let traditional = '';
   const pages = [{ url: chineseUrl, language: 'simplified' }];
-  while (pages.length && !isCancelled()) {
+  // The initial page and at most three follow-up requests share one lookup budget.
+  while (pages.length && seen.size < 4 && !isCancelled()) {
     const page = pages.shift();
     if (seen.has(page.url)) continue;
     seen.add(page.url);
@@ -204,7 +212,9 @@ async function preferredVideoTitle(inputUrl, fetchPage, isCancelled = () => fals
     original ||= titles.original;
     if (titles.language === 'simplified' && titles.translated) return titles.translated;
     if (titles.language === 'traditional') traditional ||= titles.translated;
-    pages.push(...titles.alternatives);
+    for (const alternate of titles.alternatives) {
+      if (!seen.has(alternate.url) && !pages.some((page) => page.url === alternate.url)) pages.push(alternate);
+    }
     pages.sort((a, b) => (a.language === 'traditional') - (b.language === 'traditional'));
   }
   return isCancelled() ? null : traditional || original || null;
@@ -233,59 +243,6 @@ function serializeCookies(cookies) {
   return `${lines.join('\n')}\n`;
 }
 
-function isSupportedHeight(height) {
-  return Number.isInteger(height) && height >= 144 && height <= 4320;
-}
-
-function formatOptions(heights) {
-  return [{ id: 'best', label: '最佳可用画质' },
-    ...[...new Set(heights.filter(isSupportedHeight))].sort((a, b) => b - a)
-      .map((height) => ({ id: `h:${height}`, label: `${height}p 及以下`, height }))];
-}
-
-function formatsFromInfo(info) {
-  const heights = (Array.isArray(info.formats) ? info.formats : [])
-    .filter((format) => format && format.vcodec !== 'none')
-    .map((format) => Number(format.height));
-  return formatOptions(heights);
-}
-
-function formatExpression(formatId) {
-  if (formatId === 'best') return null;
-  const match = /^h:(\d{2,4})$/.exec(String(formatId));
-  const height = match ? Number(match[1]) : NaN;
-  if (!isSupportedHeight(height)) {
-    throw new Error('请选择有效的画质。');
-  }
-  return `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]`;
-}
-
-function parseProgressLine(line) {
-  const match = /\[download\]\s+([\d.]+)%/.exec(line);
-  if (!match) return null;
-  const percent = Math.max(0, Math.min(100, Number(match[1])));
-  if (!Number.isFinite(percent)) return null;
-  const speed = /\bat\s+(\S+)/.exec(line)?.[1];
-  const eta = /\bETA\s+(\S+)/.exec(line)?.[1];
-  return { percent, speed, eta, message: line.slice(0, 240) };
-}
-
-function explainYtdlpError(stderr, fallback = '视频处理失败。') {
-  const output = String(stderr || '');
-  if (/Redirection detected; the video may be deleted or require login/i.test(output)) {
-    return '网站将视频页面重定向。请在网页登录窗口确认视频可播放，并完成网站要求的登录后重试。';
-  }
-  if (/No video formats found/i.test(output)) {
-    return '未找到可下载画质。请在网页登录窗口确认视频可播放；若仍失败，可能是网站更新导致 yt-dlp 暂时无法提取。';
-  }
-  if (/HTTP Error 474/i.test(output)) {
-    return '媒体服务器拒绝了此视频的下载地址（HTTP 474）。请尝试其他视频；若持续失败，请更新 yt-dlp 后重试。';
-  }
-  const errors = output.split(/\r?\n/).filter((line) => /^ERROR:/i.test(line.trim()));
-  const detail = errors.at(-1)?.replace(/^\s*ERROR:\s*/i, '').trim();
-  return detail ? detail.slice(0, 500) : fallback;
-}
-
 module.exports = {
   isSiteHost,
   normalizeResourceUrl,
@@ -296,8 +253,5 @@ module.exports = {
   preferredVideoTitle,
   isSiteCookie,
   serializeCookies,
-  formatOptions, formatsFromInfo,
-  formatExpression,
-  parseProgressLine,
-  explainYtdlpError,
+  ...ytdlpProtocol,
 };

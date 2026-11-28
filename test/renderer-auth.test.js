@@ -2,38 +2,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
-
-function renderAuth(api) {
-  const elements = new Map();
-  function element(key) {
-    if (!elements.has(key)) elements.set(key, {
-      value: '', textContent: '', hidden: false, disabled: false,
-      dataset: {}, style: {}, handlers: {},
-      classList: { add() {}, remove() {}, toggle() {} },
-      addEventListener(name, callback) { this.handlers[name] = callback; },
-      setAttribute() {}, removeAttribute() {}, replaceChildren() {},
-    });
-    return elements.get(key);
-  }
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'renderer.js'), 'utf8'), {
-    window: { porngo: {
-      getDirectory: async () => path.join(__dirname, '..', 'downtest'),
-      onDownloadEvent() {},
-      ...api,
-    } },
-    document: { getElementById: element, querySelector: element },
-  });
-  return element;
-}
+const { createRendererHarness } = require('./helpers/renderer-harness');
 
 test('session status distinguishes verified login, saved data, and no session', async () => {
   let resolveInitial;
   let onStatus;
   let onClosed;
-  const element = renderAuth({
+  const { element } = createRendererHarness({
     sessionStatus: () => new Promise((resolve) => { resolveInitial = resolve; }),
     onSessionStatusChanged: (callback) => { onStatus = callback; },
     onLoginClosed: (callback) => { onClosed = callback; },
@@ -66,14 +41,14 @@ test('automatic login closure before the open IPC reply keeps the confirmed stat
   let resolveOpen;
   let closed;
   let windowChanged;
-  const element = renderAuth({
+  const { element } = createRendererHarness({
     sessionStatus: async () => ({ cookieCount: 0, loginState: 'empty', revision: 0 }),
     openLogin: () => new Promise((resolve) => { resolveOpen = resolve; }),
     onLoginClosed: (callback) => { closed = callback; },
     onLoginWindowChanged: (callback) => { windowChanged = callback; },
   });
   await new Promise(setImmediate);
-  const opening = element('login-button').handlers.click();
+  const opening = element('login-button').dispatch('click');
   windowChanged({ windowOpen: false, revision: 2 });
   closed({ cookieCount: 3, loginState: 'recently_verified', revision: 2 });
   resolveOpen({ windowOpen: true, revision: 1 });

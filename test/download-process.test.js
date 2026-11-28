@@ -2,12 +2,17 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const path = require('node:path');
+const { observeTaskkill } = require('./taskkill-fixture');
 const { spawn } = require('node:child_process');
 const { EventEmitter, once } = require('node:events');
 const { downloadSpawnOptions, terminateProcessTree } = require('../src/download-process');
 
 test('download roots are detached from the utility and never open a console', () => {
-  assert.deepEqual(downloadSpawnOptions(), { windowsHide: true, shell: false, detached: true });
+  const { windowsHide, shell, detached, env } = downloadSpawnOptions();
+  assert.deepEqual({ windowsHide, shell, detached }, { windowsHide: true, shell: false, detached: true });
+  assert.equal(env.PYTHONUTF8, '1');
+  assert.equal(env.PYTHONIOENCODING, 'utf-8');
 });
 
 test('Windows termination targets the created PID and waits for tree killer', async () => {
@@ -23,7 +28,9 @@ test('Windows termination targets the created PID and waits for tree killer', as
       command = cmd; args = values; options = opts; return killer;
     },
   }).then((result) => { finished = true; return result; });
-  assert.equal(command, 'taskkill.exe');
+  const root = process.env.SystemRoot;
+  assert.equal(command, root && path.win32.isAbsolute(root)
+    ? path.win32.join(root, 'System32', 'taskkill.exe') : 'taskkill.exe');
   assert.deepEqual(args, ['/PID', '4321', '/T', '/F']);
   assert.equal(options.shell, false);
   assert.equal(finished, false);
@@ -69,7 +76,7 @@ test('Windows tree termination also stops a spawned grandchild', { skip: process
     windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'ignore'],
   });
   let grandchildPid;
-  const errors = [];
+  const probe = observeTaskkill();
   try {
     grandchildPid = await new Promise((resolve, reject) => {
       let output = '';
@@ -87,18 +94,13 @@ test('Windows tree termination also stops a spawned grandchild', { skip: process
     const closed = once(parent, 'close');
     const terminated = await terminateProcessTree(parent, {
       platform: 'win32',
-      spawnProcess: (cmd, args, options) => {
-        const killer = spawn(cmd, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
-        killer.stderr.on('data', (chunk) => errors.push(chunk));
-        return killer;
-      },
+      spawnProcess: probe.spawnProcess,
     });
-    const errorText = new TextDecoder('gbk').decode(Buffer.concat(errors));
-    if (!terminated && /拒绝访问|Access is denied/i.test(errorText)) {
+    if (!terminated && probe.restricted()) {
       t.skip('Windows taskkill is denied by the current sandbox');
       return;
     }
-    assert.equal(terminated, true, errorText);
+    assert.equal(terminated, true, probe.diagnostic());
     await closed;
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {

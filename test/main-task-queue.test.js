@@ -4,6 +4,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs/promises');
+const os = require('node:os');
 const { createDownloadTasks } = require('../src/download-tasks');
 
 function mainQueueHarness(overrides = {}) {
@@ -18,6 +20,7 @@ function mainQueueHarness(overrides = {}) {
     getSnapshot: (id) => parsedResources.get(id),
     validateDownloadDirectory: async (directory) => directory,
     mkdir: async () => {},
+    realpath: async (directory) => directory,
     createCookieFile: async () => ({ file: 'cookie-file', cleanup: async () => {} }),
     processDownloadQueue: (videos, callbacks) => new Promise((resolve) => { runs.push({ resolve, callbacks, videos }); }),
     downloadOne: (task) => Promise.resolve(task),
@@ -89,24 +92,23 @@ test('main process queues a parsed resource and retains it after its snapshot is
 });
 
 test('cancellation while resolving a batch video title prevents starting the download process', async () => {
-  let finishTitle;
+  let titleSignal;
   let spawned = false;
-  let downloadTask;
   const queue = mainQueueHarness({
-    resolveVideoTitle: (_video, task) => {
-      downloadTask = task;
-      return new Promise((resolve) => { finishTitle = resolve; });
+    resolveVideoTitle: (_video, { signal }) => {
+      titleSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
     },
     downloadOne: () => { spawned = true; },
   });
   const first = await queue.startDownload(request('snapshot-a'));
   await flush();
   const pending = queue.runs[0].callbacks.download({ item: { video: {} }, reportProgress() {} });
-  const abortController = new AbortController();
-  downloadTask.titleAbortController = abortController;
+  assert.equal(titleSignal.aborted, false);
   await queue.cancelDownload(first.taskId);
-  assert.equal(abortController.signal.aborted, true);
-  finishTitle();
+  assert.equal(titleSignal.aborted, true);
   assert.equal(await pending, null);
   assert.equal(spawned, false);
   queue.runs[0].resolve({ failures: [] });
@@ -189,8 +191,20 @@ test('performer submissions validate the selection and preserve snapshot order f
   settleRun(queue.runs[2], [null, null, null]);
 });
 
-test('all final failures retain their original settings and retry only selected videos after cache changes', async () => {
-  const queue = mainQueueHarness();
+test('all final failures retain their original settings and retry only selected videos after cache changes', async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'porngo-cookie-test-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, 'cookies.txt');
+  await fs.writeFile(file, 'original');
+  const queue = mainQueueHarness({
+    createCookieFile: async () => ({ file, cleanup: async () => {} }),
+    downloadOne: async (task) => {
+      assert.notEqual(task.cookieFile.file, file);
+      assert.equal(await fs.readFile(task.cookieFile.file, 'utf8'), 'original');
+      await fs.writeFile(task.cookieFile.file, 'updated');
+      return task;
+    },
+  });
   const snapshotId = 'snapshot-a';
   queue.parsedResources.set(snapshotId, { kind: 'playlist', id: 'original', title: 'Original list', videos: Array.from({ length: 5 }, (_, index) =>
     ({ url: `https://example.test/video-${index}`, title: `Video ${index}` })) });
@@ -210,7 +224,11 @@ test('all final failures retain their original settings and retry only selected 
   const retry = await queue.retryDownload({ taskId: original.taskId, itemIndices: [5, 2], directory: 'wrong', formatId: 'best' });
   await flush();
   assert.deepEqual(Array.from(queue.runs[1].videos, (video) => video.url), ['https://example.test/video-1', 'https://example.test/video-4']);
-  const retryTask = await queue.runs[1].callbacks.download({ item: {}, reportProgress() {} });
+  const invoke = () => queue.runs[1].callbacks.download({ item: {}, reportProgress() {} });
+  const [retryTask, sibling] = await Promise.all([invoke(), invoke()]);
+  assert.notEqual(retryTask.cookieFile.file, sibling.cookieFile.file);
+  assert.deepEqual(await fs.readdir(directory), ['cookies.txt']);
+  assert.equal(await fs.readFile(file, 'utf8'), 'original');
   assert.equal(retryTask.directory, path.join('C:\\Downloads', 'Original list [original]'));
   assert.match(retryTask.format, /height<=720/);
   assert.equal(retryTask.fragmentConcurrency, 4);
@@ -329,3 +347,13 @@ test('disjoint retries produce increasing revisions when an earlier retry finish
   assert.equal(queue.events.at(-1).failedBatch.items.length, 0);
 });
 
+
+test('a batch folder resolving outside the selected directory is rejected before queuing', async () => {
+  const base = path.resolve('downloads');
+  const queue = mainQueueHarness({
+    realpath: async (directory) => directory === base ? base : path.resolve('outside', 'batch'),
+  });
+  queue.parsedResources.set('batch', { kind: 'playlist', id: 'example', title: 'Batch', videos: [] });
+  await assert.rejects(queue.startDownload({ ...request('batch'), directory: base }), /保存目录之外/);
+  assert.equal(queue.runs.length, 0);
+});
